@@ -1,0 +1,20 @@
+[package]
+name = "ccs-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Ratatui screens, live-tail watcher, and metadata cache for claude-code-scrollback"
+
+[dependencies]
+ccs-core.workspace = true
+
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+
+ratatui.workspace = true
+crossterm.workspace = true
+nucleo.workspace = true
+notify.workspace = true
+tokio.workspace = true

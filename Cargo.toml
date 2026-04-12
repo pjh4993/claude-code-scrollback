@@ -1,0 +1,43 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ccs-core",
+    "crates/ccs-tui",
+    "crates/ccs-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/pjh4993/claude-code-scrollback"
+
+[workspace.dependencies]
+# shared
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# core
+dirs = "5"
+notify = "7"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "sync", "time"] }
+
+# tui
+ratatui = "0.29"
+crossterm = { version = "0.28", features = ["event-stream"] }
+nucleo = "0.5"
+
+# cli
+clap = { version = "4", features = ["derive"] }
+
+# internal
+ccs-core = { path = "crates/ccs-core" }
+ccs-tui = { path = "crates/ccs-tui" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
