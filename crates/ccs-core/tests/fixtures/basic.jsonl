@@ -1,0 +1,14 @@
+{"type":"user","uuid":"u1","sessionId":"s1","timestamp":"2026-04-12T08:00:00.000Z","cwd":"/tmp/project","gitBranch":"main","version":"2.1.90","message":{"role":"user","content":"hello world"}}
+{"type":"assistant","uuid":"a1","parentUuid":"u1","sessionId":"s1","timestamp":"2026-04-12T08:00:01.000Z","message":{"role":"assistant","content":[{"type":"thinking","thinking":"let me think"},{"type":"text","text":"hi back"},{"type":"tool_use","id":"tu1","name":"Read","input":{"path":"/tmp/x"}}]}}
+{"type":"user","uuid":"u2","parentUuid":"a1","sessionId":"s1","timestamp":"2026-04-12T08:00:02.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu1","content":"file contents","is_error":false}]}}
+{"type":"system","uuid":"sys1","sessionId":"s1","timestamp":"2026-04-12T08:00:03.000Z","level":"info","subtype":"hook","stopReason":null}
+{"type":"attachment","uuid":"att1","sessionId":"s1","timestamp":"2026-04-12T08:00:04.000Z","attachment":{"kind":"image","path":"/tmp/img.png"}}
+{"type":"progress","phase":"running","pct":42}
+{"type":"queue-operation","op":"push","itemId":"q1"}
+{"type":"last-prompt","text":"summarize"}
+{"type":"file-history-snapshot","messageId":"m1","isSnapshotUpdate":false,"snapshot":{}}
+{"type":"pr-link","prNumber":15,"prUrl":"https://github.com/x/y/pull/15","prRepository":"x/y","sessionId":"s1","timestamp":"2026-04-12T08:00:05.000Z"}
+{"type":"permission-mode","permissionMode":"default","sessionId":"s1"}
+{"type":"custom-title","title":"my session"}
+{"type":"agent-name","name":"general-purpose"}
+{"type":"user","uuid":"u3","sessionId":"s1","timestamp":"2026-04-12T08:00:06.000Z","version":"remote-bridge","message":{"content":"(remote session message)"}}
