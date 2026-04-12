@@ -64,6 +64,7 @@ impl TailReader {
     /// compaction) the reader resets to byte 0, drops the partial-line
     /// buffer, and re-reads from the top. The returned [`PollResult::reset`]
     /// flag signals this to the caller.
+    #[tracing::instrument(level = "trace", skip(self), fields(path = %self.path.display(), offset = self.offset))]
     pub fn poll(&mut self) -> anyhow::Result<PollResult> {
         let mut result = PollResult::default();
         let mut file = match File::open(&self.path) {
