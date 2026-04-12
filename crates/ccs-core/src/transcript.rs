@@ -8,10 +8,14 @@
 //!
 //! The UI (`ccs-tui`) consumes this module; the CLI's `ccs print` will too.
 
+use std::fs::File;
+use std::io::{BufRead, BufReader};
+use std::path::Path;
+
 use serde_json::Value;
 
 use crate::jsonl::{
-    AttachmentEvent, ContentBlock, Event, MessageContent, MessageEvent, SystemEvent,
+    self, AttachmentEvent, ContentBlock, Event, MessageContent, MessageEvent, SystemEvent,
 };
 
 /// A full session prepared for rendering.
@@ -60,6 +64,34 @@ pub enum Block {
     },
     Attachment(String),
     Unknown,
+}
+
+/// Read a JSONL session file from disk and lower it into a [`Transcript`].
+///
+/// Lines that fail to parse are skipped and logged at `warn`; the viewer
+/// should never fail to open a session because of a single corrupt line.
+pub fn load_from_path(path: &Path) -> anyhow::Result<Transcript> {
+    let file = File::open(path)?;
+    let reader = BufReader::new(file);
+    let mut events: Vec<Event> = Vec::new();
+    for (idx, line) in reader.lines().enumerate() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        match jsonl::parse_line(&line) {
+            Ok(ev) => events.push(ev),
+            Err(err) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    lineno = idx + 1,
+                    error = %err,
+                    "skipping malformed JSONL line",
+                );
+            }
+        }
+    }
+    Ok(from_events(events))
 }
 
 /// Build a [`Transcript`] from a stream of parsed events.
@@ -491,5 +523,39 @@ mod tests {
         let line = r#"{"type":"user","uuid":"u1","sessionId":"s1","timestamp":"t","message":{"role":"user","content":""}}"#;
         let t = from_events(events(&[line]));
         assert!(t.messages.is_empty());
+    }
+
+    #[test]
+    fn load_from_path_reads_jsonl_and_skips_malformed() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let mut f = File::create(&path).unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"user","uuid":"u1","sessionId":"s1","timestamp":"t","cwd":"/proj","message":{{"role":"user","content":"hi"}}}}"#
+        )
+        .unwrap();
+        writeln!(f, "this is not json").unwrap();
+        writeln!(f).unwrap(); // blank line
+        writeln!(
+            f,
+            r#"{{"type":"assistant","uuid":"a1","sessionId":"s1","timestamp":"t","message":{{"role":"assistant","content":[{{"type":"text","text":"ok"}}]}}}}"#
+        )
+        .unwrap();
+        drop(f);
+
+        let t = load_from_path(&path).unwrap();
+        assert_eq!(t.session_id, "s1");
+        assert_eq!(t.project.as_deref(), Some("/proj"));
+        assert_eq!(t.messages.len(), 2);
+        assert_eq!(t.messages[0].role, Role::User);
+        assert_eq!(t.messages[1].role, Role::Assistant);
+    }
+
+    #[test]
+    fn load_from_path_missing_file_errors() {
+        let err = load_from_path(Path::new("/nonexistent/path/does/not/exist.jsonl"));
+        assert!(err.is_err());
     }
 }

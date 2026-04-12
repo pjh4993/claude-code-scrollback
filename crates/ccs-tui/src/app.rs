@@ -1,10 +1,12 @@
 use anyhow::Result;
 use ccs_core::session::SessionFile;
+use ccs_core::transcript;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::DefaultTerminal;
 
 use crate::ui;
 use crate::ui::picker::PickerState;
+use crate::ui::transcript::{handle_key as handle_transcript_key, Action, TranscriptState};
 
 /// Top-level screen the app is currently rendering.
 ///
@@ -16,7 +18,36 @@ pub enum Screen {
     Viewer {
         live: bool,
         session: Option<SessionFile>,
+        state: Option<TranscriptState>,
     },
+}
+
+impl Screen {
+    /// Eagerly load a session file into a [`TranscriptState`] when one is
+    /// present. Called once on screen entry; failures are logged and fall
+    /// through to an empty-state viewer so the user still has a way back
+    /// to the picker.
+    fn hydrate(&mut self) {
+        if let Screen::Viewer {
+            session: Some(session),
+            state: state_slot @ None,
+            ..
+        } = self
+        {
+            match transcript::load_from_path(&session.path) {
+                Ok(t) => {
+                    *state_slot = Some(TranscriptState::new(t));
+                }
+                Err(err) => {
+                    tracing::error!(
+                        path = %session.path.display(),
+                        error = %err,
+                        "failed to load transcript from path",
+                    );
+                }
+            }
+        }
+    }
 }
 
 pub struct App {
@@ -25,7 +56,8 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(screen: Screen) -> Self {
+    pub fn new(mut screen: Screen) -> Self {
+        screen.hydrate();
         Self {
             screen,
             should_quit: false,
@@ -36,13 +68,11 @@ impl App {
     pub fn run(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
         tracing::info!("entering tui run loop");
         while !self.should_quit {
-            terminal.draw(|frame| match &self.screen {
+            terminal.draw(|frame| match &mut self.screen {
                 Screen::Picker(state) => ui::picker::render(frame, state),
-                Screen::Viewer { live, session } => ui::viewer::render(
-                    frame,
-                    *live,
-                    session.as_ref().map(|s| s.session_id.as_str()),
-                ),
+                Screen::Viewer { live, state, .. } => {
+                    ui::viewer::render(frame, *live, state.as_mut())
+                }
             })?;
             self.handle_event()?;
             self.process_screen_transitions();
@@ -60,10 +90,18 @@ impl App {
 
         match &mut self.screen {
             Screen::Picker(state) => handle_picker_key(state, key.code, &mut self.should_quit),
-            Screen::Viewer { .. } => match key.code {
-                KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
-                _ => {}
-            },
+            Screen::Viewer { state, .. } => {
+                if let Some(state) = state {
+                    if handle_transcript_key(state, key) == Action::Quit {
+                        self.should_quit = true;
+                    }
+                } else {
+                    // Placeholder viewer: only q/Esc to quit.
+                    if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc) {
+                        self.should_quit = true;
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -71,10 +109,13 @@ impl App {
     fn process_screen_transitions(&mut self) {
         if let Screen::Picker(state) = &mut self.screen {
             if let Some(session) = state.take_open_request() {
-                self.screen = Screen::Viewer {
+                let mut next = Screen::Viewer {
                     live: false,
                     session: Some(session),
+                    state: None,
                 };
+                next.hydrate();
+                self.screen = next;
             }
         }
     }
