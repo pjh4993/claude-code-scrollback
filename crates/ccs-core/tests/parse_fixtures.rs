@@ -54,6 +54,28 @@ struct Counts {
     unknown: usize,
 }
 
+/// Expected per-variant counts for `basic.jsonl`. Kept here so every test
+/// that drains the full fixture asserts against the same target — regressing
+/// the split path by dropping an event type fails the test instead of
+/// silently passing a looser subset check.
+fn expected_basic_counts() -> Counts {
+    Counts {
+        user: 3, // normal user, tool_result user, remote-bridge user
+        assistant: 1,
+        system: 1,
+        attachment: 1,
+        progress: 1,
+        queue_operation: 1,
+        last_prompt: 1,
+        file_history_snapshot: 1,
+        pr_link: 1,
+        permission_mode: 1,
+        custom_title: 1,
+        agent_name: 1,
+        unknown: 0,
+    }
+}
+
 fn count(events: &[ccs_core::tail::TailEvent]) -> Counts {
     let mut c = Counts::default();
     for ev in events {
@@ -94,25 +116,10 @@ fn basic_fixture_parses_every_event_type_without_errors_or_unknowns() {
         "first poll on a fresh file must not signal reset"
     );
 
-    let c = count(&result.events);
     assert_eq!(
-        c,
-        Counts {
-            user: 3, // normal user, tool_result user, remote-bridge user
-            assistant: 1,
-            system: 1,
-            attachment: 1,
-            progress: 1,
-            queue_operation: 1,
-            last_prompt: 1,
-            file_history_snapshot: 1,
-            pr_link: 1,
-            permission_mode: 1,
-            custom_title: 1,
-            agent_name: 1,
-            unknown: 0,
-        },
-        "per-type counts drifted — update basic.jsonl or the assertion together"
+        count(&result.events),
+        expected_basic_counts(),
+        "per-type counts drifted — update basic.jsonl or expected_basic_counts together"
     );
 }
 
@@ -146,12 +153,10 @@ fn partial_trailing_line_is_buffered_across_polls() {
 
     let mut combined = first.events;
     combined.extend(second.events);
-    let c = count(&combined);
-    assert_eq!(c.unknown, 0);
     assert_eq!(
-        c.user + c.assistant + c.system + c.attachment,
-        6,
-        "must see every typed event across the split"
+        count(&combined),
+        expected_basic_counts(),
+        "split+resume must reproduce the same per-variant counts as a single poll"
     );
 }
 
