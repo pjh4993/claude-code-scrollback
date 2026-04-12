@@ -1,0 +1,18 @@
+[package]
+name = "ccs-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "claude-code-scrollback binary"
+
+[[bin]]
+name = "claude-code-scrollback"
+path = "src/main.rs"
+
+[dependencies]
+ccs-tui.workspace = true
+
+anyhow.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
