@@ -69,6 +69,7 @@ pub fn decode_project_dir(name: &str) -> PathBuf {
 /// per file. Non-JSONL files and directories without readable metadata are
 /// silently skipped. A missing root returns an empty list rather than an
 /// error — a fresh machine with no Claude Code sessions is not a failure.
+#[tracing::instrument(level = "debug", skip_all, fields(root = %root.display()))]
 pub fn discover(root: &Path) -> anyhow::Result<Vec<SessionFile>> {
     let mut out = Vec::new();
     let project_dirs = match fs::read_dir(root) {
@@ -126,6 +127,7 @@ pub fn discover(root: &Path) -> anyhow::Result<Vec<SessionFile>> {
             });
         }
     }
+    tracing::debug!(count = out.len(), "session discovery complete");
     Ok(out)
 }
 
