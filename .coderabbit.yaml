@@ -1,5 +1,7 @@
 # yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
 reviews:
+  auto_review:
+    auto_pause_after_reviewed_commits: 2
   high_level_summary: false
   changed_files_summary: false
   sequence_diagrams: false
