@@ -236,6 +236,7 @@ mod tests {
         // block. This depends on the current layout emission order; if
         // `layout::build` changes where text bodies appear the loop will
         // need to be updated or replaced with a direct cursor set.
+        let mut found_text_body = false;
         for _ in 0..50 {
             if let Some(rl) = s.lines().get(s.cursor()) {
                 use crate::ui::transcript::state::LineKind;
@@ -243,6 +244,7 @@ mod tests {
                     if let Some(bi) = rl.block_index {
                         let msg = &s.transcript().messages[rl.msg_index];
                         if matches!(msg.blocks[bi], ccs_core::transcript::Block::Text(_)) {
+                            found_text_body = true;
                             break;
                         }
                     }
@@ -250,6 +252,10 @@ mod tests {
             }
             handle_key(&mut s, key(KeyCode::Char('j')));
         }
+        assert!(
+            found_text_body,
+            "failed to locate a Text Body line in the current layout"
+        );
         handle_key(&mut s, key(KeyCode::Char('t')));
         assert_eq!(s.flash(), Some("not collapsible"));
     }
@@ -276,6 +282,14 @@ mod tests {
         let mut s = state_with_tooling();
         handle_key(&mut s, key(KeyCode::Char('{')));
         assert_eq!(s.flash(), Some("no previous user turns"));
+    }
+
+    #[test]
+    fn close_brace_at_bottom_flashes_no_next() {
+        let mut s = state_with_tooling();
+        handle_key(&mut s, key(KeyCode::Char('G'))); // jump to EOF
+        handle_key(&mut s, key(KeyCode::Char('}')));
+        assert_eq!(s.flash(), Some("no more user turns"));
     }
 
     #[test]

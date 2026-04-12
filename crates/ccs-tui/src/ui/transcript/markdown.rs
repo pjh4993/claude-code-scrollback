@@ -150,7 +150,18 @@ impl Walker {
                 self.push_style(|s| s.add_modifier(Modifier::DIM | Modifier::ITALIC));
             }
             Tag::CodeBlock(_) => {
-                self.flush_line();
+                // If a code block is the first child of a list item,
+                // `pending_item_prefix` is set but `cur_spans` is empty
+                // — flushing here would emit a bare `• ` row. Drop the
+                // prefix so `emit_code_block_text` renders the code at
+                // the item's indent without a stray bullet line. (Code
+                // blocks inside lists lose the bullet marker for v1;
+                // acceptable simplification.)
+                if self.cur_spans.is_empty() {
+                    self.pending_item_prefix = None;
+                } else {
+                    self.flush_line();
+                }
                 self.in_code_block = true;
             }
             Tag::List(start) => {
@@ -202,29 +213,29 @@ impl Walker {
         match tag {
             TagEnd::Paragraph => {
                 self.flush_line();
-                self.out.push(Line::from(""));
+                self.out.push(Line::default());
             }
             TagEnd::Heading(_) => {
                 self.flush_line();
                 self.pop_style();
-                self.out.push(Line::from(""));
+                self.out.push(Line::default());
             }
             TagEnd::BlockQuote(_) => {
                 self.flush_line();
                 self.pop_indent("│ ");
                 self.pop_style();
-                self.out.push(Line::from(""));
+                self.out.push(Line::default());
             }
             TagEnd::CodeBlock => {
                 self.flush_line();
                 self.in_code_block = false;
-                self.out.push(Line::from(""));
+                self.out.push(Line::default());
             }
             TagEnd::List(_) => {
                 self.flush_line();
                 self.list_stack.pop();
                 if self.list_stack.is_empty() {
-                    self.out.push(Line::from(""));
+                    self.out.push(Line::default());
                 }
             }
             TagEnd::Item => {
@@ -313,12 +324,13 @@ impl Walker {
     fn append_span(&mut self, span: Span<'static>, width: usize) {
         // Merge with previous span if the style matches; keeps Line.spans
         // tiny (1–3 spans per line in the common case) and avoids
-        // megabyte-sized Vec<Span> on long paragraphs.
+        // megabyte-sized Vec<Span> on long paragraphs. Mutating the
+        // existing buffer via `Cow::to_mut` keeps the merge amortized
+        // O(1) per character instead of O(n²) (a fresh allocation +
+        // full copy per append).
         if let Some(last) = self.cur_spans.last_mut() {
             if last.style == span.style {
-                let mut merged = last.content.to_string();
-                merged.push_str(&span.content);
-                last.content = merged.into();
+                last.content.to_mut().push_str(&span.content);
                 self.cur_width += width;
                 return;
             }
@@ -487,12 +499,37 @@ mod tests {
         assert!(out.len() >= 3, "expected multi-line wrap, got: {out:?}");
         for line in &out {
             if !line.is_empty() {
-                assert!(
-                    line.chars().count() <= 30,
-                    "line exceeds wrap width: {line:?}"
-                );
+                // Assert against Unicode display width to match the
+                // renderer's own wrap math (`UnicodeWidthChar::width`).
+                assert!(str_width(line) <= 30, "line exceeds wrap width: {line:?}");
             }
         }
+    }
+
+    #[test]
+    fn code_block_inside_list_item_does_not_emit_empty_bullet() {
+        // Regression: `Tag::CodeBlock` used to flush a line with only a
+        // `pending_item_prefix` set, producing a `• ` row above the code.
+        let src = "- item\n\n  ```\n  let x = 1;\n  ```\n";
+        let out = render(src, 80);
+        // No line should be exactly "• " with nothing else.
+        assert!(
+            !out.iter().any(|l| l.trim() == "•"),
+            "found bare bullet line: {out:?}"
+        );
+        assert!(out.iter().any(|l| l.contains("let x = 1;")));
+    }
+
+    #[test]
+    fn blank_separator_dedupes_between_blocks() {
+        // Regression: separators must be `Line::default()` so the
+        // trim_excess_trailing_blanks helper can recognise and dedupe them.
+        let raw = render_markdown("para one\n\npara two", 80);
+        let blank_run = raw
+            .windows(2)
+            .filter(|w| w[0].spans.is_empty() && w[1].spans.is_empty())
+            .count();
+        assert_eq!(blank_run, 0, "two adjacent blank lines not deduped");
     }
 
     #[test]
