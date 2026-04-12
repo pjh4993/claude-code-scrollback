@@ -1,43 +1,23 @@
 # claude-code-scrollback
-Terminal TUI for browsing, searching, and live-tailing Claude Code session history
 
-## Debugging / logs
+A terminal TUI for browsing, searching, and live-tailing [Claude Code](https://claude.com/claude-code) session history.
 
-The app writes rotating daily log files to the OS cache directory so the TUI
-never has to share stderr with your logs:
+`claude-code-scrollback` reads the JSONL session files that Claude Code writes under `~/.claude/projects/` and presents them as a navigable, searchable transcript — so you can go back to any past conversation without scrolling your terminal emulator or hunting through raw files.
 
-| Platform | Default path |
-|----------|--------------|
-| macOS    | `~/Library/Caches/claude-code-scrollback/logs/ccs.log.<YYYY-MM-DD>` |
-| Linux    | `$XDG_CACHE_HOME/claude-code-scrollback/logs/ccs.log.<YYYY-MM-DD>` (falls back to `~/.cache/...`) |
-| Windows  | `%LOCALAPPDATA%\claude-code-scrollback\logs\ccs.log.<YYYY-MM-DD>` |
+## Features
 
-Control verbosity and format with CLI flags or the `RUST_LOG` env var. The
-CLI flag wins if both are set:
+- **Session picker** ranked by affinity to the directory you launch from, so the project you're working on surfaces first.
+- **Transcript viewer** with vim-style navigation (`j`/`k`, `g`/`G`, `Ctrl-d`/`Ctrl-u`).
+- **Live tail mode** (`--live`) for watching an active session update in real time.
+- **Open-by-path or by-id** — point at a session id prefix, or hand it any `.jsonl` file on disk.
+- **Rotating file logs** kept out of stderr so the TUI stays clean.
 
-```bash
-claude-code-scrollback --log-level debug
-claude-code-scrollback --log-level 'ccs_core=trace,info'
-claude-code-scrollback --log-format json
-RUST_LOG=debug claude-code-scrollback
-```
+## Documentation
 
-Tail the live log in a second pane while the TUI is running:
+- [**Installation**](./docs/installation.md) — prerequisites and building from source.
+- [**Quick start**](./docs/quickstart.md) — first run, keybindings, common flags.
+- [**Contributing**](./docs/contributing.md) — dev loop, pre-commit hook, CI checks, log file locations.
 
-```bash
-tail -f ~/Library/Caches/claude-code-scrollback/logs/ccs.log.*
-```
+## License
 
-## Contributing
-
-This repo uses [`pre-commit`](https://pre-commit.com/) to run `cargo fmt` and
-`cargo clippy` before every commit. After cloning, install the hook once:
-
-```bash
-brew install pre-commit   # or: pip install pre-commit
-pre-commit install
-```
-
-CI runs the same checks (`cargo fmt --all -- --check`,
-`cargo clippy --workspace --all-targets -- -D warnings`,
-`cargo check --workspace --all-targets`) on every push and pull request.
+See [LICENSE](./LICENSE).
