@@ -1,8 +1,8 @@
 use ratatui::{
-    Frame,
     layout::{Constraint, Layout},
     style::{Style, Stylize},
     widgets::{Block, Borders, Paragraph},
+    Frame,
 };
 
 pub fn render(frame: &mut Frame, live: bool, session: Option<&str>) {
@@ -19,10 +19,7 @@ pub fn render(frame: &mut Frame, live: bool, session: Option<&str>) {
         (false, None) => "transcript viewer".to_string(),
     };
 
-    frame.render_widget(
-        Paragraph::new(title).style(Style::new().bold()),
-        header,
-    );
+    frame.render_widget(Paragraph::new(title).style(Style::new().bold()), header);
     frame.render_widget(
         Block::default()
             .borders(Borders::ALL)

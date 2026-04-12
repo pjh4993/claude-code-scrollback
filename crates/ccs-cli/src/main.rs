@@ -21,8 +21,14 @@ fn main() -> Result<()> {
 
     let cli = Cli::parse();
     let initial = match (cli.live, cli.session) {
-        (true, _) => Screen::Viewer { live: true, session: None },
-        (false, Some(id)) => Screen::Viewer { live: false, session: Some(id) },
+        (true, _) => Screen::Viewer {
+            live: true,
+            session: None,
+        },
+        (false, Some(id)) => Screen::Viewer {
+            live: false,
+            session: Some(id),
+        },
         (false, None) => Screen::Picker,
     };
 

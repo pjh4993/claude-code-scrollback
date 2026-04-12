@@ -17,7 +17,10 @@ pub struct App {
 
 impl App {
     pub fn new(screen: Screen) -> Self {
-        Self { screen, should_quit: false }
+        Self {
+            screen,
+            should_quit: false,
+        }
     }
 
     pub fn run(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
