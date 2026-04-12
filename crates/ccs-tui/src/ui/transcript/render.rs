@@ -80,7 +80,7 @@ fn build_status(state: &TranscriptState) -> Line<'static> {
     let session_short = short_session_id(&t.session_id);
 
     let parts = format!(
-        "session {session_short}  ·  project {project}  ·  msg {current_msg}/{total_msgs}  ·  line {current_line}/{total_lines}  ·  q quit"
+        "session {session_short}  ·  project {project}  ·  msg {current_msg}/{total_msgs}  ·  line {current_line}/{total_lines}  ·  q/Esc quit"
     );
     Line::from(Span::raw(parts))
 }

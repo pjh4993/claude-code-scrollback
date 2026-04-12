@@ -12,7 +12,11 @@ use ratatui::text::{Line, Span};
 
 use super::state::{LineKind, RenderedLine};
 
-const MIN_WRAP_WIDTH: usize = 20;
+/// Fallback wrap width used only when the caller has not yet set a real
+/// viewport (first draw, width == 0). A real narrow terminal — even
+/// something ridiculous like 8 columns — is rendered as-is so the user
+/// sees what their terminal is actually showing.
+const UNKNOWN_WIDTH_FALLBACK: usize = 80;
 
 /// Build the full line cache for `transcript` at the given body width.
 ///
@@ -37,11 +41,10 @@ pub fn build(transcript: &Transcript, width: u16) -> Vec<RenderedLine> {
 }
 
 fn effective_wrap_width(width: u16) -> usize {
-    let w = width as usize;
-    if w < MIN_WRAP_WIDTH {
-        80
+    if width == 0 {
+        UNKNOWN_WIDTH_FALLBACK
     } else {
-        w
+        width as usize
     }
 }
 
@@ -155,11 +158,11 @@ fn append_block(out: &mut Vec<RenderedLine>, msg_index: usize, block: &Block, wr
             }
         }
         Block::Attachment(s) => {
+            let style = Style::new().fg(Color::Blue);
             let text = format!("[attachment] {s}");
-            out.push(body_line(
-                msg_index,
-                Line::from(Span::styled(text, Style::new().fg(Color::Blue))),
-            ));
+            for chunk in wrap_plain(&text, wrap_at) {
+                out.push(body_line(msg_index, Line::from(Span::styled(chunk, style))));
+            }
         }
         Block::Unknown => {
             out.push(body_line(
@@ -271,14 +274,45 @@ mod tests {
     }
 
     #[test]
-    fn narrow_viewport_falls_back_to_sane_wrap_width() {
+    fn unknown_viewport_falls_back_to_80() {
         // width = 0 happens on the first draw before set_viewport runs.
         let t = tx(&[
             r#"{"type":"user","uuid":"u1","sessionId":"s1","timestamp":"t","message":{"role":"user","content":"hello world"}}"#,
         ]);
         let lines = build(&t, 0);
-        // Should not blow up and should still emit content.
         assert!(lines.iter().any(|l| l.kind == LineKind::Body));
+    }
+
+    #[test]
+    fn real_narrow_viewport_wraps_at_its_own_width() {
+        // Regression: previously any width < 20 was treated as "unknown" and
+        // force-fallen-back to 80 cols, so a real 10-col terminal rendered
+        // overflow. Now a nonzero width is honored, however small.
+        let long = "x".repeat(30);
+        let line = format!(
+            r#"{{"type":"user","uuid":"u1","sessionId":"s1","timestamp":"t","message":{{"role":"user","content":"{long}"}}}}"#
+        );
+        let t = tx(&[&line]);
+        let lines = build(&t, 10);
+        // 30 chars / 10 cols = 3 wrapped body lines
+        let body_count = lines.iter().filter(|l| l.kind == LineKind::Body).count();
+        assert_eq!(body_count, 3);
+    }
+
+    #[test]
+    fn attachment_wraps_long_paths() {
+        // Regression: attachments used to push a single unwrapped line.
+        let long_path = format!("/very/long/{}", "x".repeat(200));
+        let t = tx(&[&format!(
+            r#"{{"type":"attachment","uuid":"a1","sessionId":"s1","timestamp":"t","attachment":{{"type":"file","path":"{long_path}"}}}}"#
+        )]);
+        let lines = build(&t, 40);
+        let body_count = lines.iter().filter(|l| l.kind == LineKind::Body).count();
+        // Long attachment summary must span multiple wrapped body lines.
+        assert!(
+            body_count >= 4,
+            "expected attachment to wrap across >=4 lines, got {body_count}"
+        );
     }
 
     #[test]

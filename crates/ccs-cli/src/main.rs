@@ -88,16 +88,35 @@ fn discover_sessions() -> Result<Vec<SessionFile>> {
 /// 1. If `target` points at an existing file on disk, open it directly —
 ///    this is how `claude-code-scrollback path/to/session.jsonl` works,
 ///    including files outside `~/.claude/projects/`.
-/// 2. Otherwise, treat `target` as a session id prefix and resolve it
+/// 2. Otherwise, if `target` *looks* path-like (contains a path separator
+///    or starts with `.`/`/`), fail fast with a clear file-not-found
+///    error instead of silently falling through to id resolution. This
+///    catches typos like `./fixtures/missing.jsonl` early.
+/// 3. Otherwise, treat `target` as a session id prefix and resolve it
 ///    against the project directory via [`discover_sessions`].
 fn resolve_session_target(target: &str) -> Result<Option<SessionFile>> {
     let path = Path::new(target);
     if path.is_file() {
         return Ok(Some(session_file_from_path(path)?));
     }
+    if looks_like_path(target) {
+        anyhow::bail!(
+            "session file not found: {target} (path does not exist or is not a regular file)"
+        );
+    }
     Ok(discover_sessions()?
         .into_iter()
         .find(|s| s.session_id.starts_with(target)))
+}
+
+/// Heuristic: does `target` look like a filesystem path rather than a
+/// session id? Session ids are UUIDs with no separators; anything
+/// containing `/`, `\`, or starting with `.`/`/` is treated as a path.
+fn looks_like_path(target: &str) -> bool {
+    target.contains(std::path::MAIN_SEPARATOR)
+        || target.contains('/')
+        || target.contains('\\')
+        || target.starts_with('.')
 }
 
 /// Synthesize a [`SessionFile`] for an arbitrary path on disk. Used by the
