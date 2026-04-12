@@ -77,10 +77,10 @@ pub fn from_events(events: impl IntoIterator<Item = Event>) -> Transcript {
     for ev in events {
         match ev {
             Event::User(me) => {
+                capture_meta(&mut out, &me);
                 if me.is_sidechain {
                     continue;
                 }
-                capture_meta(&mut out, &me);
                 let blocks = lower_message_content(me.message.content);
                 if blocks.is_empty() {
                     continue;
@@ -95,10 +95,10 @@ pub fn from_events(events: impl IntoIterator<Item = Event>) -> Transcript {
                 next_index += 1;
             }
             Event::Assistant(me) => {
+                capture_meta(&mut out, &me);
                 if me.is_sidechain {
                     continue;
                 }
-                capture_meta(&mut out, &me);
                 let blocks = lower_message_content(me.message.content);
                 if blocks.is_empty() {
                     continue;
@@ -113,10 +113,10 @@ pub fn from_events(events: impl IntoIterator<Item = Event>) -> Transcript {
                 next_index += 1;
             }
             Event::System(se) => {
+                if out.session_id.is_empty() {
+                    out.session_id = se.session_id.clone();
+                }
                 if let Some(msg) = lower_system_event(se, next_index) {
-                    if out.session_id.is_empty() {
-                        out.session_id = msg.uuid.clone();
-                    }
                     out.messages.push(msg);
                     next_index += 1;
                 }
@@ -435,6 +435,34 @@ mod tests {
         let t = from_events(events(lines));
         let indices: Vec<usize> = t.messages.iter().map(|m| m.index).collect();
         assert_eq!(indices, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn sidechain_envelopes_still_contribute_metadata() {
+        // Regression: sidechain messages are dropped from `messages`, but their
+        // `sessionId` / `cwd` should still populate the transcript metadata.
+        let lines = &[
+            r#"{"type":"user","uuid":"u1","sessionId":"s-sidechain","timestamp":"t","cwd":"/proj","isSidechain":true,"message":{"role":"user","content":"sub"}}"#,
+            r#"{"type":"assistant","uuid":"a1","sessionId":"s-sidechain","timestamp":"t","message":{"role":"assistant","content":[{"type":"text","text":"hi"}]}}"#,
+        ];
+        let t = from_events(events(lines));
+        assert_eq!(t.session_id, "s-sidechain");
+        assert_eq!(t.project.as_deref(), Some("/proj"));
+        assert_eq!(t.messages.len(), 1);
+        assert_eq!(t.messages[0].role, Role::Assistant);
+    }
+
+    #[test]
+    fn system_first_uses_session_id_not_message_uuid() {
+        // Regression: `out.session_id` must come from `SystemEvent.session_id`,
+        // never from the message `uuid` (a different identifier class).
+        let lines = &[
+            r#"{"type":"system","uuid":"sys-uuid-1","sessionId":"s-real","timestamp":"t","subtype":"tool_error","level":"warn"}"#,
+            r#"{"type":"user","uuid":"u1","sessionId":"s-real","timestamp":"t","message":{"role":"user","content":"hi"}}"#,
+        ];
+        let t = from_events(events(lines));
+        assert_eq!(t.session_id, "s-real");
+        assert_ne!(t.session_id, "sys-uuid-1");
     }
 
     #[test]
