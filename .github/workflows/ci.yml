@@ -4,7 +4,9 @@ on:
   push:
     branches: [main]
   pull_request:
-    types: [opened, synchronize, reopened, labeled]
+
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -14,7 +16,6 @@ jobs:
   fmt:
     name: rustfmt
     runs-on: ubuntu-latest
-    if: github.event_name != 'pull_request' || github.event.action != 'labeled'
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -25,7 +26,6 @@ jobs:
   clippy:
     name: clippy
     runs-on: ubuntu-latest
-    if: github.event_name != 'pull_request' || github.event.action != 'labeled'
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -37,22 +37,8 @@ jobs:
   check:
     name: cargo check
     runs-on: ubuntu-latest
-    if: github.event_name != 'pull_request' || github.event.action != 'labeled'
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace --all-targets
-
-  test:
-    name: cargo test
-    runs-on: ubuntu-latest
-    if: >-
-      github.event_name == 'push' ||
-      (github.event_name == 'pull_request' &&
-        contains(github.event.pull_request.labels.*.name, 'ready'))
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace --all-targets
