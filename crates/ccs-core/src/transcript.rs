@@ -8,10 +8,14 @@
 //!
 //! The UI (`ccs-tui`) consumes this module; the CLI's `ccs print` will too.
 
+use std::fs::File;
+use std::io::{BufRead, BufReader};
+use std::path::Path;
+
 use serde_json::Value;
 
 use crate::jsonl::{
-    AttachmentEvent, ContentBlock, Event, MessageContent, MessageEvent, SystemEvent,
+    self, AttachmentEvent, ContentBlock, Event, MessageContent, MessageEvent, SystemEvent,
 };
 
 /// A full session prepared for rendering.
@@ -60,6 +64,42 @@ pub enum Block {
     },
     Attachment(String),
     Unknown,
+}
+
+/// Read a JSONL session file from disk and lower it into a [`Transcript`].
+///
+/// Lines that fail to parse are skipped and logged at `warn`; a single
+/// corrupt line never prevents the viewer from opening. If *every*
+/// non-empty line fails to parse, this returns an error so the viewer
+/// can surface "this file is not a Claude Code session" instead of
+/// silently rendering an empty transcript.
+pub fn load_from_path(path: &Path) -> anyhow::Result<Transcript> {
+    let file = File::open(path)?;
+    let reader = BufReader::new(file);
+    let mut events: Vec<Event> = Vec::new();
+    let mut saw_non_empty = false;
+    for (idx, line) in reader.lines().enumerate() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        saw_non_empty = true;
+        match jsonl::parse_line(&line) {
+            Ok(ev) => events.push(ev),
+            Err(err) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    lineno = idx + 1,
+                    error = %err,
+                    "skipping malformed JSONL line",
+                );
+            }
+        }
+    }
+    if saw_non_empty && events.is_empty() {
+        anyhow::bail!("no valid JSONL events recovered from {}", path.display());
+    }
+    Ok(from_events(events))
 }
 
 /// Build a [`Transcript`] from a stream of parsed events.
@@ -490,6 +530,68 @@ mod tests {
     fn empty_user_text_produces_no_message() {
         let line = r#"{"type":"user","uuid":"u1","sessionId":"s1","timestamp":"t","message":{"role":"user","content":""}}"#;
         let t = from_events(events(&[line]));
+        assert!(t.messages.is_empty());
+    }
+
+    #[test]
+    fn load_from_path_reads_jsonl_and_skips_malformed() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let mut f = File::create(&path).unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"user","uuid":"u1","sessionId":"s1","timestamp":"t","cwd":"/proj","message":{{"role":"user","content":"hi"}}}}"#
+        )
+        .unwrap();
+        writeln!(f, "this is not json").unwrap();
+        writeln!(f).unwrap(); // blank line
+        writeln!(
+            f,
+            r#"{{"type":"assistant","uuid":"a1","sessionId":"s1","timestamp":"t","message":{{"role":"assistant","content":[{{"type":"text","text":"ok"}}]}}}}"#
+        )
+        .unwrap();
+        drop(f);
+
+        let t = load_from_path(&path).unwrap();
+        assert_eq!(t.session_id, "s1");
+        assert_eq!(t.project.as_deref(), Some("/proj"));
+        assert_eq!(t.messages.len(), 2);
+        assert_eq!(t.messages[0].role, Role::User);
+        assert_eq!(t.messages[1].role, Role::Assistant);
+    }
+
+    #[test]
+    fn load_from_path_missing_file_errors() {
+        let err = load_from_path(Path::new("/nonexistent/path/does/not/exist.jsonl"));
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn load_from_path_fully_corrupt_file_errors() {
+        // Regression: a non-empty file whose every line fails to parse must
+        // surface an error rather than quietly returning an empty transcript.
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("garbage.jsonl");
+        let mut f = File::create(&path).unwrap();
+        writeln!(f, "not json").unwrap();
+        writeln!(f, "also not json").unwrap();
+        drop(f);
+
+        let err = load_from_path(&path).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("no valid JSONL events"), "got: {msg}");
+    }
+
+    #[test]
+    fn load_from_path_empty_file_is_ok() {
+        // Distinct from fully-corrupt: a truly empty file produces an empty
+        // transcript without erroring (nothing failed to parse).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.jsonl");
+        File::create(&path).unwrap();
+        let t = load_from_path(&path).unwrap();
         assert!(t.messages.is_empty());
     }
 }

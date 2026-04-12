@@ -2,10 +2,12 @@ mod logging;
 
 use anyhow::Result;
 use ccs_core::metadata::LazyFsSource;
-use ccs_core::session::{self, SessionFile};
+use ccs_core::session::{self, SessionFile, SessionKind};
 use ccs_tui::ui::picker::PickerState;
 use ccs_tui::{App, Screen};
 use clap::Parser;
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use crate::logging::LogFormat;
 
@@ -26,7 +28,10 @@ struct Cli {
     #[arg(long, value_enum, default_value_t = LogFormat::Text)]
     log_format: LogFormat,
 
-    /// Open a specific session by id (or id prefix).
+    /// Open a specific session. Accepts either:
+    ///
+    /// * a session id (or id prefix), resolved against `~/.claude/projects/`, or
+    /// * a direct path to a `.jsonl` session file.
     session: Option<String>,
 }
 
@@ -38,10 +43,12 @@ fn main() -> Result<()> {
         (true, _) => Screen::Viewer {
             live: true,
             session: None,
+            state: None,
         },
-        (false, Some(id)) => Screen::Viewer {
+        (false, Some(target)) => Screen::Viewer {
             live: false,
-            session: resolve_session_by_id(&id)?,
+            session: resolve_session_target(&target)?,
+            state: None,
         },
         (false, None) => Screen::Picker(build_picker()?),
     };
@@ -75,17 +82,67 @@ fn discover_sessions() -> Result<Vec<SessionFile>> {
     session::discover(&root)
 }
 
-/// Find a session by id prefix for the `claude-code-scrollback <id>` form.
+/// Resolve the `session` positional arg into an optional [`SessionFile`].
 ///
-/// Returns the **first** session whose `session_id` starts with the prefix,
-/// or `None` if there was no match (the viewer renders its empty state).
-/// Ambiguous prefixes that match multiple sessions currently resolve to
-/// whichever session `discover` yielded first — when the picker is
-/// self-hosted via `claude-code-scrollback <prefix>`, the caller should
-/// supply a long enough prefix to disambiguate.
-fn resolve_session_by_id(prefix: &str) -> Result<Option<SessionFile>> {
-    let sessions = discover_sessions()?;
-    Ok(sessions
+/// Tries in order:
+/// 1. If `target` points at an existing file on disk, open it directly —
+///    this is how `claude-code-scrollback path/to/session.jsonl` works,
+///    including files outside `~/.claude/projects/`.
+/// 2. Otherwise, if `target` *looks* path-like (contains a path separator
+///    or starts with `.`/`/`), fail fast with a clear file-not-found
+///    error instead of silently falling through to id resolution. This
+///    catches typos like `./fixtures/missing.jsonl` early.
+/// 3. Otherwise, treat `target` as a session id prefix and resolve it
+///    against the project directory via [`discover_sessions`].
+fn resolve_session_target(target: &str) -> Result<Option<SessionFile>> {
+    let path = Path::new(target);
+    if path.is_file() {
+        return Ok(Some(session_file_from_path(path)?));
+    }
+    if looks_like_path(target) {
+        anyhow::bail!(
+            "session file not found: {target} (path does not exist or is not a regular file)"
+        );
+    }
+    Ok(discover_sessions()?
         .into_iter()
-        .find(|s| s.session_id.starts_with(prefix)))
+        .find(|s| s.session_id.starts_with(target)))
+}
+
+/// Heuristic: does `target` look like a filesystem path rather than a
+/// session id? Session ids are UUIDs with no separators; anything
+/// containing `/`, `\`, or starting with `.`/`/` is treated as a path.
+fn looks_like_path(target: &str) -> bool {
+    target.contains(std::path::MAIN_SEPARATOR)
+        || target.contains('/')
+        || target.contains('\\')
+        || target.starts_with('.')
+}
+
+/// Synthesize a [`SessionFile`] for an arbitrary path on disk. Used by the
+/// `<path>` positional form, which intentionally bypasses project-root
+/// discovery so users can open JSONLs from anywhere (fixtures, copies,
+/// etc.). `session_id` is derived from the file stem, `project_cwd` from
+/// the parent directory.
+fn session_file_from_path(path: &Path) -> Result<SessionFile> {
+    let abs: PathBuf = path.canonicalize()?;
+    let metadata = std::fs::metadata(&abs)?;
+    let session_id = abs
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("session")
+        .to_string();
+    let project_cwd = abs
+        .parent()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    Ok(SessionFile {
+        path: abs,
+        session_id,
+        parent_session_id: None,
+        kind: SessionKind::Primary,
+        project_cwd,
+        modified: metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+        size: metadata.len(),
+    })
 }
