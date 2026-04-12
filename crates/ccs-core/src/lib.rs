@@ -6,9 +6,11 @@
 //! - [`tail`] — incremental reader for live-tail and bulk ingest
 //! - [`metadata`] — pluggable picker row metadata (lazy FS today, SQLite later)
 //! - [`checkpoints`] — manual marks + auto-checkpoint detection and persistence
+//! - [`transcript`] — viewer-friendly lowering of parsed events
 
 pub mod checkpoints;
 pub mod jsonl;
 pub mod metadata;
 pub mod session;
 pub mod tail;
+pub mod transcript;
