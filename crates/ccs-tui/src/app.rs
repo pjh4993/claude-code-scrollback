@@ -13,37 +13,53 @@ use crate::ui::transcript::{handle_key as handle_transcript_key, Action, Transcr
 /// `Picker` owns the picker's event-loop state directly; that state is
 /// non-trivial (sessions, cursor, search buffer, metadata source) so we
 /// keep it inside the enum rather than rebuilding it on every transition.
+/// The `Viewer` payload is `Box`ed so the enum's size stays close to
+/// `PickerState` and the `clippy::large_enum_variant` gate passes.
 pub enum Screen {
     Picker(PickerState),
-    Viewer {
-        live: bool,
-        session: Option<SessionFile>,
-        state: Option<TranscriptState>,
-    },
+    Viewer(Box<ViewerScreen>),
+}
+
+/// Owned viewer-screen state. Heap-allocated so the `Screen` enum stays
+/// compact: `TranscriptState` carries the whole transcript plus the
+/// line cache, which is much larger than `PickerState`.
+pub struct ViewerScreen {
+    pub live: bool,
+    pub session: Option<SessionFile>,
+    pub state: Option<TranscriptState>,
 }
 
 impl Screen {
+    /// Construct a fresh viewer screen, hydrating the transcript if a
+    /// session is provided.
+    pub fn viewer(live: bool, session: Option<SessionFile>) -> Self {
+        let mut screen = Screen::Viewer(Box::new(ViewerScreen {
+            live,
+            session,
+            state: None,
+        }));
+        screen.hydrate();
+        screen
+    }
+
     /// Eagerly load a session file into a [`TranscriptState`] when one is
     /// present. Called once on screen entry; failures are logged and fall
     /// through to an empty-state viewer so the user still has a way back
     /// to the picker.
     fn hydrate(&mut self) {
-        if let Screen::Viewer {
-            session: Some(session),
-            state: state_slot @ None,
-            ..
-        } = self
-        {
-            match transcript::load_from_path(&session.path) {
-                Ok(t) => {
-                    *state_slot = Some(TranscriptState::new(t));
-                }
-                Err(err) => {
-                    tracing::error!(
-                        path = %session.path.display(),
-                        error = %err,
-                        "failed to load transcript from path",
-                    );
+        if let Screen::Viewer(v) = self {
+            if let (Some(session), None) = (&v.session, &v.state) {
+                match transcript::load_from_path(&session.path) {
+                    Ok(t) => {
+                        v.state = Some(TranscriptState::new(t));
+                    }
+                    Err(err) => {
+                        tracing::error!(
+                            path = %session.path.display(),
+                            error = %err,
+                            "failed to load transcript from path",
+                        );
+                    }
                 }
             }
         }
@@ -70,9 +86,7 @@ impl App {
         while !self.should_quit {
             terminal.draw(|frame| match &mut self.screen {
                 Screen::Picker(state) => ui::picker::render(frame, state),
-                Screen::Viewer { live, state, .. } => {
-                    ui::viewer::render(frame, *live, state.as_mut())
-                }
+                Screen::Viewer(v) => ui::viewer::render(frame, v.live, v.state.as_mut()),
             })?;
             self.handle_event()?;
             self.process_screen_transitions();
@@ -90,8 +104,8 @@ impl App {
 
         match &mut self.screen {
             Screen::Picker(state) => handle_picker_key(state, key.code, &mut self.should_quit),
-            Screen::Viewer { state, .. } => {
-                if let Some(state) = state {
+            Screen::Viewer(v) => {
+                if let Some(state) = v.state.as_mut() {
                     if handle_transcript_key(state, key) == Action::Quit {
                         self.should_quit = true;
                     }
@@ -109,13 +123,7 @@ impl App {
     fn process_screen_transitions(&mut self) {
         if let Screen::Picker(state) = &mut self.screen {
             if let Some(session) = state.take_open_request() {
-                let mut next = Screen::Viewer {
-                    live: false,
-                    session: Some(session),
-                    state: None,
-                };
-                next.hydrate();
-                self.screen = next;
+                self.screen = Screen::viewer(false, Some(session));
             }
         }
     }

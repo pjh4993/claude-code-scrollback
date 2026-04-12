@@ -6,6 +6,8 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use super::state::TranscriptState;
+use super::yank;
+use crate::clipboard;
 
 /// High-level result of consuming one key event. `app.rs` maps this onto
 /// `self.should_quit` / screen transitions.
@@ -17,14 +19,26 @@ pub enum Action {
 
 /// Consume a `KeyEvent` and mutate `state` accordingly.
 ///
+/// Normal-mode keys:
 /// * `j` / `k` / `↓` / `↑`        — line down / up
 /// * `Ctrl-d` / `Ctrl-u`          — half-page down / up
 /// * `g g` / `G` / `Home` / `End` — jump to top / bottom
 /// * `{` / `}`                    — prev / next user turn
 /// * `t`                          — toggle collapse on block under cursor
 /// * `T`                          — cycle collapse-all (tools & thinking)
+/// * `/`                          — begin search
+/// * `n` / `N`                    — next / prev search match (in active search)
+/// * `y`                          — yank current message to clipboard
 /// * `q` / `Esc`                  — quit
+///
+/// While search is typing: `Enter` commits, `Esc` cancels, `Backspace`
+/// deletes one char, any other character extends the query.
 pub fn handle_key(state: &mut TranscriptState, key: KeyEvent) -> Action {
+    // Search-typing mode owns the whole keyboard; route first.
+    if state.search_mode().is_typing() {
+        return handle_search_typing(state, key);
+    }
+
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let pending_g = state.pending_g();
     // Every keypress clears the gg chord unless it's the second g, and
@@ -89,7 +103,67 @@ pub fn handle_key(state: &mut TranscriptState, key: KeyEvent) -> Action {
             Action::None
         }
 
+        KeyCode::Char('/') => {
+            state.begin_search();
+            Action::None
+        }
+        KeyCode::Char('n') => {
+            state.next_match();
+            Action::None
+        }
+        KeyCode::Char('N') => {
+            state.prev_match();
+            Action::None
+        }
+
+        KeyCode::Char('y') => {
+            yank_current_message(state);
+            Action::None
+        }
+
         _ => Action::None,
+    }
+}
+
+fn handle_search_typing(state: &mut TranscriptState, key: KeyEvent) -> Action {
+    match key.code {
+        KeyCode::Esc => {
+            state.cancel_search();
+            state.set_flash("search cancelled");
+        }
+        KeyCode::Enter => {
+            state.commit_search();
+        }
+        KeyCode::Backspace => {
+            state.pop_search_char();
+        }
+        KeyCode::Char(ch) => {
+            state.push_search_char(ch);
+        }
+        _ => {}
+    }
+    Action::None
+}
+
+fn yank_current_message(state: &mut TranscriptState) {
+    let msg_idx = state.current_msg_index();
+    let Some(message) = state.transcript().messages.get(msg_idx) else {
+        state.set_flash("nothing to yank");
+        return;
+    };
+    let text = yank::format_message(message);
+    let n = text.len();
+    match clipboard::copy(&text) {
+        Ok(clipboard::CopyMethod::System) => {
+            state.set_flash(format!("yanked {n} chars (system)"));
+        }
+        Ok(clipboard::CopyMethod::Osc52) => {
+            state.set_flash(format!("yanked {n} chars (osc52)"));
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "clipboard copy failed");
+            state.set_flash("yank failed (see logs)");
+        }
     }
 }
 

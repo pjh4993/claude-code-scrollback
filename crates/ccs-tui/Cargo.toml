@@ -20,6 +20,15 @@ notify.workspace = true
 tokio.workspace = true
 pulldown-cmark.workspace = true
 unicode-width.workspace = true
+memchr.workspace = true
+arboard.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "search"
+harness = false
 
 [lints]
 workspace = true
