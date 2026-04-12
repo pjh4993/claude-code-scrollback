@@ -268,18 +268,19 @@ fn flatten_tool_result_content(v: Value) -> String {
         Value::Array(items) => {
             let mut out = String::new();
             for (i, item) in items.iter().enumerate() {
-                if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
-                    if i > 0 {
-                        out.push('\n');
-                    }
-                    out.push_str(text);
-                } else {
-                    // Fallback: stringify non-text blocks as JSON.
-                    if i > 0 {
-                        out.push('\n');
-                    }
-                    out.push_str(&pretty_json(item));
+                if i > 0 {
+                    out.push('\n');
                 }
+                // Only treat `{type:"text", text:"..."}` as body text; any other
+                // block shape (e.g. `{type:"image", ...}`) falls back to JSON.
+                let is_text_block = item.get("type").and_then(|t| t.as_str()) == Some("text");
+                if is_text_block {
+                    if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
+                        out.push_str(text);
+                        continue;
+                    }
+                }
+                out.push_str(&pretty_json(item));
             }
             out
         }
@@ -371,6 +372,26 @@ mod tests {
         let t = from_events(events(&[line]));
         match &t.messages[0].blocks[0] {
             Block::ToolResult { content, .. } => assert_eq!(content, "line1\nline2"),
+            other => panic!("expected ToolResult, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tool_result_array_non_text_block_falls_back_to_json() {
+        // Regression: only `{type:"text", text:...}` entries should be
+        // concatenated as body text; other block shapes must fall through to
+        // the pretty-JSON representation, even if they happen to have a `text`
+        // field (e.g. an image block with alt text).
+        let line = r#"{"type":"user","uuid":"u1","sessionId":"s1","timestamp":"t","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu1","content":[{"type":"text","text":"hello"},{"type":"image","text":"alt","source":{"data":"..."}}]}]}}"#;
+        let t = from_events(events(&[line]));
+        match &t.messages[0].blocks[0] {
+            Block::ToolResult { content, .. } => {
+                assert!(content.starts_with("hello\n"));
+                // The image block must NOT be rendered as just "alt"; it must
+                // appear as JSON containing its `type` field.
+                assert!(content.contains("\"image\""));
+                assert!(content.contains("\"source\""));
+            }
             other => panic!("expected ToolResult, got {other:?}"),
         }
     }
