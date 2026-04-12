@@ -15,7 +15,7 @@
 //! Not wired into CI — run manually or on a weekly cadence. See [`ccs_core`]
 //! issue #14 for the policy rationale.
 //!
-//! # Baseline — 2026-04-13, Apple M4 Pro (12-core), macOS 26.3.1, APFS
+//! # Baseline — 2026-04-12 (UTC), Apple M4 Pro (12-core), macOS 26.3.1, APFS
 //!
 //! ```text
 //! discover/1000       3.67 ms  (median)   — 272 Kelem/s
@@ -42,20 +42,31 @@ use ccs_core::session;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use tempfile::TempDir;
 
-/// Populate `root` with `session_count` empty session JSONLs, spread across
-/// `session_count / 10` project dirs so both the outer and inner `read_dir`
-/// paths in [`session::discover`] get exercised.
+/// Populate `root` with exactly `session_count` empty session JSONLs,
+/// spread across ~`session_count / 10` project dirs so both the outer and
+/// inner `read_dir` paths in [`session::discover`] get exercised. The loop
+/// breaks out the moment it hits `session_count`, so non-multiple-of-10
+/// inputs don't overshoot.
 fn populate(root: &Path, session_count: usize) {
     let project_count = (session_count / 10).max(1);
     let per_project = session_count.div_ceil(project_count);
+    let mut created = 0usize;
     for p in 0..project_count {
+        if created == session_count {
+            break;
+        }
         let proj = root.join(format!("-tmp-bench-project-{p:06}"));
         fs::create_dir_all(&proj).expect("mkdir project");
         for s in 0..per_project {
+            if created == session_count {
+                break;
+            }
             let path = proj.join(format!("{p:06}-{s:04}.jsonl"));
             fs::write(path, b"").expect("write session stub");
+            created += 1;
         }
     }
+    debug_assert_eq!(created, session_count);
 }
 
 fn bench_discover(c: &mut Criterion) {

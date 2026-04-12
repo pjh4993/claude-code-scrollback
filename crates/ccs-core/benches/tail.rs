@@ -1,9 +1,18 @@
 //! Benchmarks for [`ccs_core::tail::TailReader::poll`].
 //!
-//! Measures cold-read throughput — the first-ever [`poll`](ccs_core::tail::TailReader::poll)
-//! call against a pre-populated JSONL file. This is the path a picker
-//! preview takes when it opens a session, and the live-tail catch-up path
-//! when a reader attaches to a session that has already been running.
+//! Measures the **first `poll()` call on a freshly-constructed
+//! [`TailReader`]** against a pre-populated JSONL file. This is the path a
+//! picker preview takes when it opens a session, and the live-tail
+//! catch-up path when a reader attaches to a session that has already
+//! been running.
+//!
+//! Note that "first poll" is a *parser-path* cold state, not a *disk*
+//! cold state: every iteration re-opens the same file, so the OS page
+//! cache is warm after the first iter. The numbers below are therefore an
+//! upper bound on what the parser can achieve when bytes are already in
+//! memory — which is also the state the picker will be in on a warm
+//! session. Actual disk-cold reads will be slower on spinning disks or
+//! network filesystems; we don't try to simulate that here.
 //!
 //! We deliberately cap the largest size at 100k lines (not the 1M suggested
 //! in the ticket): real Claude Code sessions rarely exceed a few thousand
@@ -18,7 +27,7 @@
 //!
 //! Not wired into CI — see [`ccs_core`] issue #14.
 //!
-//! # Baseline — 2026-04-13, Apple M4 Pro (12-core), macOS 26.3.1, APFS
+//! # Baseline — 2026-04-12 (UTC), Apple M4 Pro (12-core), macOS 26.3.1, APFS
 //!
 //! ```text
 //! tail_cold/1000       1.39 ms   (median)  —  721 Kelem/s
