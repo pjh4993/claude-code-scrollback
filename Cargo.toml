@@ -37,6 +37,12 @@ clap = { version = "4", features = ["derive"] }
 ccs-core = { path = "crates/ccs-core" }
 ccs-tui = { path = "crates/ccs-tui" }
 
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
