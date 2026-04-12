@@ -4,7 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
-    types: [labeled]
+    types: [opened, synchronize, reopened, labeled, unlabeled]
 
 env:
   CARGO_TERM_COLOR: always
@@ -14,17 +14,14 @@ jobs:
   test:
     name: cargo test
     runs-on: ubuntu-latest
-    # Only run on push to main, or when the `ready` label is applied to a PR.
-    # We intentionally omit `synchronize` from the trigger types: an unlabeled
-    # PR would otherwise run this workflow, the `if` would evaluate false, and
-    # GitHub would report the required check as "skipped" (which counts as
-    # passing). Restricting triggers means the required check stays pending
-    # until the label is applied. To re-run tests after new commits, remove
-    # and re-add the `ready` label.
-    if: >-
-      github.event_name == 'push' ||
-      (github.event_name == 'pull_request' && github.event.label.name == 'ready')
     steps:
+      - name: Gate on ready label
+        if: >-
+          github.event_name == 'pull_request' &&
+          !contains(github.event.pull_request.labels.*.name, 'ready')
+        run: |
+          echo "::error::cargo test requires the 'ready' label on the PR. Apply the label to run tests."
+          exit 1
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
