@@ -1,1 +1,22 @@
 /target
+
+# rustfmt backups
+**/*.rs.bk
+
+# Editor/IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.*
+
+# Claude Code (contributor-local)
+CLAUDE.md
+.claude/
