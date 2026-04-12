@@ -88,10 +88,15 @@ impl SessionMetadataSource for LazyFsSource {
 /// most [`HEAD_READ_BYTES`] from disk. Returns `None` if the file cannot be
 /// opened, contains no user event in its header, or the first user event has
 /// no renderable text content.
+///
+/// Uses [`String::from_utf8_lossy`] so a read that lands mid multi-byte
+/// character (e.g. Korean, emoji) never fails the whole lookup — the
+/// trailing partial character becomes the replacement glyph, and the line
+/// loop below naturally skips any line whose JSON decoding trips on it.
 pub fn first_user_prompt(path: &Path) -> Option<String> {
     let mut buf = vec![0u8; HEAD_READ_BYTES];
     let n = File::open(path).ok()?.read(&mut buf).ok()?;
-    let text = std::str::from_utf8(&buf[..n]).ok()?;
+    let text = String::from_utf8_lossy(&buf[..n]);
 
     for line in text.lines() {
         if line.trim().is_empty() {
@@ -258,6 +263,42 @@ mod tests {
     fn lazy_fs_source_missing_file_returns_empty() {
         let data = LazyFsSource.fetch(&make_session(PathBuf::from("/nonexistent/path/nope.jsonl")));
         assert_eq!(data, PickerRowData::default());
+    }
+
+    #[test]
+    fn lazy_fs_source_survives_utf8_split_at_read_boundary() {
+        // Regression for a CodeRabbit finding: the 16 KiB read budget can
+        // land mid multi-byte character. Before the lossy decode, any
+        // non-ASCII content near the boundary would fail the whole lookup.
+        //
+        // Strategy: emit enough system events to push the relevant user
+        // line just past HEAD_READ_BYTES, with a Korean character whose
+        // UTF-8 encoding straddles the cut. The test passes if we still
+        // get *some* prompt out — whichever one lands inside the budget.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut body = String::new();
+        // A "normal" first-prompt line that should always be reached.
+        body.push_str(
+            r#"{"type":"user","uuid":"u1","sessionId":"x","timestamp":"t","message":{"role":"user","content":"안녕 world"}}
+"#,
+        );
+        // Pad with system events whose total byte length crosses the
+        // 16 KiB mark, each padded with Hangul so the tail of the buffer
+        // is guaranteed to land mid-codepoint somewhere.
+        let filler_char = "가"; // 3 bytes in UTF-8
+        while body.len() < HEAD_READ_BYTES + 1024 {
+            body.push_str(&format!(
+                r#"{{"type":"system","uuid":"s","sessionId":"x","timestamp":"t","subtype":"{}"}}
+"#,
+                filler_char.repeat(50)
+            ));
+        }
+        let p = write_file(tmp.path(), "a.jsonl", &body);
+        let data = LazyFsSource.fetch(&make_session(p));
+        // The first line is the user prompt; it must decode cleanly even
+        // though the 16 KiB read boundary falls inside a Hangul glyph far
+        // below that point.
+        assert_eq!(data.first_prompt.as_deref(), Some("안녕 world"));
     }
 
     #[test]

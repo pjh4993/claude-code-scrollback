@@ -65,8 +65,13 @@ fn discover_sessions() -> Result<Vec<SessionFile>> {
 }
 
 /// Find a session by id prefix for the `claude-code-scrollback <id>` form.
-/// Returns the session metadata if exactly one match is found; returns
-/// `None` if there was no match (the viewer renders its empty state).
+///
+/// Returns the **first** session whose `session_id` starts with the prefix,
+/// or `None` if there was no match (the viewer renders its empty state).
+/// Ambiguous prefixes that match multiple sessions currently resolve to
+/// whichever session `discover` yielded first — when the picker is
+/// self-hosted via `claude-code-scrollback <prefix>`, the caller should
+/// supply a long enough prefix to disambiguate.
 fn resolve_session_by_id(prefix: &str) -> Result<Option<SessionFile>> {
     let sessions = discover_sessions()?;
     Ok(sessions

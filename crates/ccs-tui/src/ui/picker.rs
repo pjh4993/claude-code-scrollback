@@ -693,11 +693,12 @@ mod tests {
     }
 
     struct CountingSource {
-        calls: std::sync::Mutex<usize>,
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     }
     impl SessionMetadataSource for CountingSource {
         fn fetch(&self, _session: &SessionFile) -> PickerRowData {
-            *self.calls.lock().unwrap() += 1;
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             PickerRowData {
                 first_prompt: Some("loaded".into()),
                 ..Default::default()
@@ -707,8 +708,10 @@ mod tests {
 
     #[test]
     fn preview_loaded_once_per_row() {
+        use std::sync::atomic::Ordering;
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let source = CountingSource {
-            calls: std::sync::Mutex::new(0),
+            calls: calls.clone(),
         };
         let mut picker = PickerState::new(
             vec![
@@ -719,11 +722,16 @@ mod tests {
             Box::new(source),
             None,
         );
-        // new() loads row 0 (freshest, so "c").
+        // new() loaded row 0 (freshest, so "c"). Two more move_down's
+        // visit "b" and "a" — three unique rows total.
         picker.move_down();
         picker.move_down();
+        // Revisiting must not re-fetch: cursor bounces across already-
+        // loaded rows and the counter must stay pinned at 3.
         picker.move_up();
         picker.move_up();
+        picker.move_down();
+
         let Some(&idx) = picker.filtered.get(picker.cursor) else {
             panic!()
         };
@@ -731,6 +739,11 @@ mod tests {
         assert_eq!(
             picker.rows[idx].meta.first_prompt.as_deref(),
             Some("loaded")
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "each row should be fetched exactly once, regardless of revisits"
         );
     }
 }
