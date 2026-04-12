@@ -30,6 +30,9 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util
 ratatui = "0.29"
 crossterm = { version = "0.28", features = ["event-stream"] }
 nucleo = "0.5"
+pulldown-cmark = { version = "0.13", default-features = false }
+# Pinned to 0.2 (resolves to 0.2.0) because ratatui 0.29 requires =0.2.0 exactly.
+unicode-width = "0.2"
 
 # cli
 clap = { version = "4", features = ["derive"] }
