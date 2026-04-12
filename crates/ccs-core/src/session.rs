@@ -13,10 +13,24 @@
 //! literal `-` character is indistinguishable from a path separator — so
 //! [`decode_project_dir`] returns a best-effort reconstruction, not a
 //! round-trip guarantee.
+//!
+//! To recover the real CWD despite the lossy encoding, [`discover`] peeks at
+//! the first few lines of one JSONL file per project dir and pulls the
+//! top-level `cwd` field that Claude Code writes on every `user`/`assistant`
+//! event. [`decode_project_dir`] is the fallback when no session in the dir
+//! carries a usable `cwd`.
 
-use std::fs;
+use std::fs::{self, File};
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
+
+/// Maximum lines scanned per JSONL when looking for a `cwd` field. The
+/// authoritative `cwd` is on every `user`/`assistant` event, and Claude Code
+/// usually emits one within the first few lines (typically after a
+/// `permission-mode` and `file-history-snapshot` preamble). 32 is comfortably
+/// above that without turning discovery into a full-file scan.
+const CWD_PROBE_MAX_LINES: usize = 32;
 
 /// Kind of session file on disk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,6 +79,49 @@ pub fn decode_project_dir(name: &str) -> PathBuf {
     }
 }
 
+/// Recover the authoritative CWD for a project dir by peeking at its session
+/// files. Returns `None` when no JSONL in the dir carries a top-level `cwd`
+/// string within the first [`CWD_PROBE_MAX_LINES`] lines — callers should
+/// fall back to [`decode_project_dir`].
+///
+/// Lines are parsed as loose [`serde_json::Value`] rather than the typed
+/// [`crate::jsonl::Event`] enum so that an unknown or broken event kind can
+/// still contribute its `cwd` field. The scan stops at the first hit.
+pub fn read_cwd_from_project_dir(project_path: &Path) -> Option<PathBuf> {
+    let rd = fs::read_dir(project_path).ok()?;
+    for entry in rd.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
+            continue;
+        }
+        if let Some(cwd) = read_cwd_from_jsonl(&path) {
+            return Some(cwd);
+        }
+    }
+    None
+}
+
+fn read_cwd_from_jsonl(path: &Path) -> Option<PathBuf> {
+    let file = File::open(path).ok()?;
+    let reader = BufReader::new(file);
+    for line in reader.lines().take(CWD_PROBE_MAX_LINES) {
+        let Ok(line) = line else { continue };
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            continue;
+        };
+        if let Some(cwd) = value.get("cwd").and_then(|v| v.as_str()) {
+            if !cwd.is_empty() {
+                return Some(PathBuf::from(cwd));
+            }
+        }
+    }
+    None
+}
+
 /// Enumerate every session JSONL under `root`, returning one [`SessionFile`]
 /// per file. Non-JSONL files and directories without readable metadata are
 /// silently skipped. A missing root returns an empty list rather than an
@@ -87,7 +144,8 @@ pub fn discover(root: &Path) -> anyhow::Result<Vec<SessionFile>> {
             Ok(n) => n,
             Err(_) => continue,
         };
-        let project_cwd = decode_project_dir(&name);
+        let project_cwd =
+            read_cwd_from_project_dir(&project_path).unwrap_or_else(|| decode_project_dir(&name));
 
         let sessions = match fs::read_dir(&project_path) {
             Ok(rd) => rd,
@@ -215,8 +273,56 @@ mod tests {
         let sessions = discover(root).unwrap();
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].session_id, "abc");
+        // No jsonl line carries `cwd`, so we fall back to the lossy decode.
         assert_eq!(sessions[0].project_cwd, PathBuf::from("/tmp/project/a"));
         assert!(sessions[0].size > 0);
+    }
+
+    #[test]
+    fn discover_prefers_jsonl_cwd_over_lossy_decode() {
+        // Project dir name `-Users-alice-claude-code-scrollback` would lossy-
+        // decode to `/Users/alice/claude/code/scrollback`. A real session
+        // line's `cwd` field is authoritative and should win.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let proj = root.join("-Users-alice-claude-code-scrollback");
+        fs::create_dir_all(&proj).unwrap();
+        let mut f = File::create(proj.join("sess.jsonl")).unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"permission-mode","permissionMode":"default"}}"#
+        )
+        .unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"user","uuid":"u","sessionId":"s","timestamp":"t","cwd":"/Users/alice/claude-code-scrollback","message":{{"role":"user","content":"hi"}}}}"#
+        )
+        .unwrap();
+
+        let sessions = discover(root).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(
+            sessions[0].project_cwd,
+            PathBuf::from("/Users/alice/claude-code-scrollback"),
+        );
+    }
+
+    #[test]
+    fn read_cwd_probes_multiple_lines_before_giving_up() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path();
+        let mut f = File::create(proj.join("a.jsonl")).unwrap();
+        // Preamble without `cwd` — parser must scan past it.
+        for _ in 0..5 {
+            writeln!(f, r#"{{"type":"permission-mode"}}"#).unwrap();
+        }
+        writeln!(
+            f,
+            r#"{{"type":"assistant","cwd":"/some/real-path","uuid":"u","sessionId":"s","timestamp":"t","message":{{"role":"assistant","content":[]}}}}"#
+        )
+        .unwrap();
+        let got = read_cwd_from_project_dir(proj);
+        assert_eq!(got, Some(PathBuf::from("/some/real-path")));
     }
 
     #[test]

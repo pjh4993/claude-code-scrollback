@@ -177,6 +177,7 @@ dependencies = [
  "ccs-core",
  "criterion",
  "crossterm",
+ "dirs",
  "memchr",
  "notify",
  "nucleo",

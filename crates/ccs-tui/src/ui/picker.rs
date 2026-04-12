@@ -313,6 +313,24 @@ fn is_dash_prefix(shorter: &str, longer: &str) -> bool {
     longer.starts_with(shorter) && longer.as_bytes()[shorter.len()] == b'-'
 }
 
+/// Render a project path for the picker's project column. Replaces the
+/// user's home directory prefix with `~` so rows stay narrow on long
+/// absolute paths like `/Users/<user>/workspace/...`.
+///
+/// The full path remains the canonical value in [`SessionFile::project_cwd`]
+/// and the search index — this is display-layer only.
+fn display_path(path: &Path) -> String {
+    if let Some(home) = dirs::home_dir() {
+        if let Ok(rest) = path.strip_prefix(&home) {
+            if rest.as_os_str().is_empty() {
+                return "~".to_string();
+            }
+            return format!("~/{}", rest.display());
+        }
+    }
+    path.display().to_string()
+}
+
 fn searchable_text(row: &PickerRow) -> String {
     // Match on project cwd + session id today; previews join the search
     // surface as they're loaded (on cursor visit). The SQLite cache (PJH-54)
@@ -381,7 +399,7 @@ pub fn render(frame: &mut Frame, state: &PickerState) {
                 Row::new(vec![
                     Cell::from(format_relative_mtime(row.session.modified)),
                     Cell::from(format_size(row.session.size)),
-                    Cell::from(row.session.project_cwd.display().to_string()),
+                    Cell::from(display_path(&row.session.project_cwd)),
                     Cell::from(
                         row.meta
                             .first_prompt
@@ -469,6 +487,21 @@ mod tests {
 
     fn state(sessions: Vec<SessionFile>) -> PickerState {
         PickerState::new(sessions, Box::new(NullSource), None)
+    }
+
+    #[test]
+    fn display_path_replaces_home_with_tilde() {
+        // Synthesise a home-rooted path rather than using the real $HOME, so
+        // the test is hermetic regardless of where it runs.
+        let home = dirs::home_dir().expect("home dir available in test env");
+        let under = home.join("workspace/claude-code-scrollback");
+        assert_eq!(display_path(&under), "~/workspace/claude-code-scrollback");
+
+        let exact_home = home.clone();
+        assert_eq!(display_path(&exact_home), "~");
+
+        let outside = PathBuf::from("/etc/hosts");
+        assert_eq!(display_path(&outside), "/etc/hosts");
     }
 
     #[test]

@@ -9,6 +9,7 @@ description = "Ratatui screens, live-tail watcher, and metadata cache for claude
 ccs-core.workspace = true
 
 anyhow.workspace = true
+dirs.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
