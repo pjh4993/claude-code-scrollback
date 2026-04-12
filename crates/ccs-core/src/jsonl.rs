@@ -129,7 +129,11 @@ pub struct SystemEvent {
     pub level: Option<String>,
     #[serde(default)]
     pub subtype: Option<String>,
-    #[serde(default)]
+    /// Claude Code stylizes this as `toolUseID` (capital ID), not
+    /// `toolUseId` as `rename_all = "camelCase"` would produce. Pinning
+    /// the exact wire name keeps the field typed instead of silently
+    /// flowing into `extra`.
+    #[serde(default, rename = "toolUseID")]
     pub tool_use_id: Option<String>,
     #[serde(default)]
     pub stop_reason: Option<String>,
