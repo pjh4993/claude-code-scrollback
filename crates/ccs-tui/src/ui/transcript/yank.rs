@@ -118,4 +118,48 @@ mod tests {
         assert!(s.contains("[thinking]\nhm"));
         assert!(s.contains("\n\nanswer"));
     }
+
+    #[test]
+    fn attachment_block_is_labeled() {
+        let m = msg(vec![Block::Attachment("/path/to/file.png".to_string())]);
+        let s = format_message(&m);
+        assert!(s.contains("[attachment] /path/to/file.png"));
+    }
+
+    #[test]
+    fn unknown_block_renders_placeholder() {
+        let m = msg(vec![Block::Unknown]);
+        let s = format_message(&m);
+        assert!(s.contains("[unknown block]"));
+    }
+
+    #[test]
+    fn system_role_is_prefixed_with_system() {
+        let m = Message {
+            index: 0,
+            role: Role::System,
+            uuid: "u1".to_string(),
+            timestamp: "2026-04-12T00:00:00Z".to_string(),
+            blocks: vec![Block::Text("boot".to_string())],
+        };
+        let s = format_message(&m);
+        assert!(s.starts_with("system @ "));
+        assert!(s.contains("boot"));
+    }
+
+    #[test]
+    fn empty_timestamp_omits_at_separator() {
+        let m = Message {
+            index: 0,
+            role: Role::User,
+            uuid: "u1".to_string(),
+            timestamp: String::new(),
+            blocks: vec![Block::Text("hi".to_string())],
+        };
+        let s = format_message(&m);
+        // First line is just "user" without the " @ " separator.
+        let first_line = s.lines().next().unwrap();
+        assert_eq!(first_line, "user");
+        assert!(s.contains("hi"));
+    }
 }

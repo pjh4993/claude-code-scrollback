@@ -377,20 +377,14 @@ impl TranscriptState {
             return;
         }
         let first = matches[0];
+        let total = matches.len();
         self.search = SearchMode::Active {
-            query: query.clone(),
+            query,
             matches,
             cursor: 0,
         };
         self.jump_to_match_line(first);
-        self.set_flash(format!(
-            "{}/{}",
-            1,
-            match &self.search {
-                SearchMode::Active { matches, .. } => matches.len(),
-                _ => 0,
-            }
-        ));
+        self.set_flash(format!("1/{total}"));
     }
 
     /// `n` — advance to the next match; wraps around at the end.
