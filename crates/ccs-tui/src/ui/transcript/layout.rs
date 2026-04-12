@@ -348,17 +348,13 @@ mod tests {
         from_events(lines.iter().map(|l| parse_line(l).unwrap()))
     }
 
-    fn empty_ctx() -> CollapseContext<'static> {
-        use std::sync::OnceLock;
-        static EMPTY: OnceLock<HashSet<BlockId>> = OnceLock::new();
-        CollapseContext {
-            collapsed: EMPTY.get_or_init(HashSet::new),
-            collapse_all: CollapseAll::Off,
-        }
-    }
-
     fn build_default(t: &Transcript, width: u16) -> LayoutOutput {
-        build(t, width, &empty_ctx())
+        let collapsed: HashSet<BlockId> = HashSet::new();
+        let ctx = CollapseContext {
+            collapsed: &collapsed,
+            collapse_all: CollapseAll::Off,
+        };
+        build(t, width, &ctx)
     }
 
     #[test]

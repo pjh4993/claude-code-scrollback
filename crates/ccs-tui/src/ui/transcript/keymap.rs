@@ -232,7 +232,10 @@ mod tests {
     #[test]
     fn t_on_text_block_sets_not_collapsible_flash() {
         let mut s = state_with_tooling();
-        // Navigate until the cursor lands on a Body line for a Text block.
+        // Walk the cursor down until it lands on a Body line for a Text
+        // block. This depends on the current layout emission order; if
+        // `layout::build` changes where text bodies appear the loop will
+        // need to be updated or replaced with a direct cursor set.
         for _ in 0..50 {
             if let Some(rl) = s.lines().get(s.cursor()) {
                 use crate::ui::transcript::state::LineKind;

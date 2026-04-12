@@ -179,6 +179,10 @@ impl Walker {
                 // Render alt text inline for v1; image loading is out of scope.
                 self.push_style(|s| s.add_modifier(Modifier::DIM));
             }
+            Tag::Superscript | Tag::Subscript => {
+                // Render as plain text for v1; the terminal can't really
+                // do super/subscript anyway.
+            }
             Tag::Table(_)
             | Tag::TableHead
             | Tag::TableRow
@@ -237,9 +241,15 @@ impl Walker {
             }
             _ => {}
         }
-        // Drop trailing blank line from accumulating past the very last block.
-        while matches!(self.out.last(), Some(l) if l.spans.is_empty())
-            && self.out.len() > 1
+        self.trim_excess_trailing_blanks();
+    }
+
+    /// After closing a block-level tag we push a blank separator line.
+    /// Adjacent blocks can produce two blanks in a row — drop any second
+    /// blank so the output never has more than one trailing blank.
+    fn trim_excess_trailing_blanks(&mut self) {
+        while self.out.len() > 1
+            && matches!(self.out.last(), Some(l) if l.spans.is_empty())
             && matches!(self.out.get(self.out.len() - 2), Some(l) if l.spans.is_empty())
         {
             self.out.pop();
@@ -348,11 +358,6 @@ impl Walker {
                 .to_string();
             let after = tail_src.content[split_point..].to_string();
             let style = tail_src.style;
-            let drop_idx = if before.is_empty() {
-                span_idx
-            } else {
-                span_idx + 1
-            };
             // Take spans after `span_idx` wholesale as tail.
             let mut trailing: Vec<Span<'static>> = self.cur_spans.drain(span_idx + 1..).collect();
             // Replace `span_idx` span with its "before" half (or drop).
@@ -368,7 +373,6 @@ impl Walker {
             self.flush_line();
             self.cur_spans = tail_spans;
             self.cur_width = self.cur_spans.iter().map(|s| str_width(&s.content)).sum();
-            let _ = drop_idx;
         } else {
             // No space in the current line — hard break.
             self.flush_line();
@@ -484,7 +488,7 @@ mod tests {
         for line in &out {
             if !line.is_empty() {
                 assert!(
-                    line.chars().count() <= 32,
+                    line.chars().count() <= 30,
                     "line exceeds wrap width: {line:?}"
                 );
             }
