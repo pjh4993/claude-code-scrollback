@@ -32,7 +32,7 @@ impl App {
         }
     }
 
-    #[tracing::instrument(level = "debug", skip_all, fields(screen = ?self.screen))]
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn run(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
         tracing::info!("entering tui run loop");
         while !self.should_quit {

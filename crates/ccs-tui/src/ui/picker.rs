@@ -697,8 +697,7 @@ mod tests {
     }
     impl SessionMetadataSource for CountingSource {
         fn fetch(&self, _session: &SessionFile) -> PickerRowData {
-            self.calls
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             PickerRowData {
                 first_prompt: Some("loaded".into()),
                 ..Default::default()
