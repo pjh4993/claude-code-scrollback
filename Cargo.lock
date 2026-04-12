@@ -111,6 +111,7 @@ name = "ccs-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "ccs-core",
  "ccs-tui",
  "clap",
  "dirs",
