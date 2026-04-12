@@ -9,7 +9,9 @@ pub mod keymap;
 pub mod layout;
 pub mod markdown;
 pub mod render;
+pub mod search;
 pub mod state;
+pub mod yank;
 
 pub use keymap::{handle_key, Action};
 pub use render::render;

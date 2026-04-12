@@ -6,6 +6,7 @@ use ccs_core::transcript::{Block, Transcript};
 use ratatui::text::Line;
 
 use super::layout;
+use super::search::{SearchIndex, SearchMatch, SearchMode};
 
 /// Stable identifier for a block inside the transcript: `(msg_index, block_index)`.
 /// Used by the collapse set and by `t` to hit-test the cursor line.
@@ -79,6 +80,10 @@ pub struct TranscriptState {
     /// Pending vim chord state: `g` seen, waiting for the second `g`.
     pending_g: bool,
 
+    /// In-viewer search UI mode. Owns the query buffer, committed
+    /// matches, and the current match cursor.
+    search: SearchMode,
+
     /// Ephemeral one-line message shown in the status bar until the next
     /// keypress clears it. Used for "not collapsible", "no more user
     /// turns", etc.
@@ -100,6 +105,7 @@ impl TranscriptState {
             collapsed: HashSet::new(),
             collapse_all: CollapseAll::Off,
             pending_g: false,
+            search: SearchMode::new(),
             flash: None,
             dirty: true,
         }
@@ -315,6 +321,121 @@ impl TranscriptState {
 
     pub fn set_pending_g(&mut self, pending: bool) {
         self.pending_g = pending;
+    }
+
+    // --- search -----------------------------------------------------------
+
+    pub fn search_mode(&self) -> &SearchMode {
+        &self.search
+    }
+
+    /// Enter search-typing mode with an empty query (response to `/`).
+    pub fn begin_search(&mut self) {
+        self.search = SearchMode::Typing {
+            query: String::new(),
+        };
+    }
+
+    /// Cancel any in-flight search and clear highlights (response to
+    /// `Esc` while searching).
+    pub fn cancel_search(&mut self) {
+        self.search = SearchMode::Idle;
+    }
+
+    /// Append one character to the search query buffer. Live-rebuilds
+    /// the match list so the user sees highlights update as they type.
+    pub fn push_search_char(&mut self, ch: char) {
+        if let SearchMode::Typing { query } = &mut self.search {
+            query.push(ch);
+        }
+    }
+
+    /// Pop the last character from the search query buffer (backspace
+    /// while in typing mode).
+    pub fn pop_search_char(&mut self) {
+        if let SearchMode::Typing { query } = &mut self.search {
+            query.pop();
+        }
+    }
+
+    /// Commit the current typing-mode query to an active search. Jumps
+    /// the cursor to the first match (if any) and flashes a summary.
+    pub fn commit_search(&mut self) {
+        let SearchMode::Typing { query } = &self.search else {
+            return;
+        };
+        let query = query.clone();
+        if query.is_empty() {
+            self.search = SearchMode::Idle;
+            return;
+        }
+        let index = SearchIndex::build(&self.lines);
+        let matches = index.find_all(&query);
+        if matches.is_empty() {
+            self.search = SearchMode::Idle;
+            self.set_flash(format!("no match for \"{query}\""));
+            return;
+        }
+        let first = matches[0];
+        self.search = SearchMode::Active {
+            query: query.clone(),
+            matches,
+            cursor: 0,
+        };
+        self.jump_to_match_line(first);
+        self.set_flash(format!(
+            "{}/{}",
+            1,
+            match &self.search {
+                SearchMode::Active { matches, .. } => matches.len(),
+                _ => 0,
+            }
+        ));
+    }
+
+    /// `n` — advance to the next match; wraps around at the end.
+    pub fn next_match(&mut self) {
+        let target = match &mut self.search {
+            SearchMode::Active {
+                matches, cursor, ..
+            } if !matches.is_empty() => {
+                *cursor = (*cursor + 1) % matches.len();
+                Some((matches[*cursor], *cursor, matches.len()))
+            }
+            _ => None,
+        };
+        if let Some((m, i, total)) = target {
+            self.jump_to_match_line(m);
+            self.set_flash(format!("{}/{}", i + 1, total));
+        }
+    }
+
+    /// `N` — step to the previous match; wraps around at the start.
+    pub fn prev_match(&mut self) {
+        let target = match &mut self.search {
+            SearchMode::Active {
+                matches, cursor, ..
+            } if !matches.is_empty() => {
+                *cursor = if *cursor == 0 {
+                    matches.len() - 1
+                } else {
+                    *cursor - 1
+                };
+                Some((matches[*cursor], *cursor, matches.len()))
+            }
+            _ => None,
+        };
+        if let Some((m, i, total)) = target {
+            self.jump_to_match_line(m);
+            self.set_flash(format!("{}/{}", i + 1, total));
+        }
+    }
+
+    fn jump_to_match_line(&mut self, m: SearchMatch) {
+        if m.line < self.lines.len() {
+            self.cursor = m.line;
+            self.clamp_scroll();
+        }
     }
 }
 

@@ -33,6 +33,11 @@ nucleo = "0.5"
 pulldown-cmark = { version = "0.13", default-features = false }
 # Pinned to 0.2 (resolves to 0.2.0) because ratatui 0.29 requires =0.2.0 exactly.
 unicode-width = "0.2"
+memchr = "2"
+arboard = { version = "3", default-features = false }
+
+# benches (tui)
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
 
 # cli
 clap = { version = "4", features = ["derive"] }

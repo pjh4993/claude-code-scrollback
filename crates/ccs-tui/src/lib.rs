@@ -5,6 +5,7 @@
 //! data model and file discovery.
 
 pub mod app;
+pub mod clipboard;
 pub mod tail;
 pub mod ui;
 

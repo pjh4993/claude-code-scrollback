@@ -1,11 +1,12 @@
 //! Draw the transcript viewer: header, body, footer status line.
 
 use ratatui::layout::{Constraint, Layout};
-use ratatui::style::{Modifier, Style, Stylize};
+use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
+use super::search::{SearchMatch, SearchMode};
 use super::state::TranscriptState;
 
 /// Render the transcript viewer into `frame`. Mutably borrows `state` so
@@ -59,17 +60,97 @@ fn slice_visible(state: &TranscriptState, height: u16) -> Vec<Line<'static>> {
     }
     let start = state.scroll();
     let end = (start + height as usize).min(lines.len());
-    lines[start..end].iter().map(|l| l.line.clone()).collect()
+    let active_matches: &[SearchMatch] = match state.search_mode() {
+        SearchMode::Active { matches, .. } => matches,
+        _ => &[],
+    };
+    lines[start..end]
+        .iter()
+        .enumerate()
+        .map(|(i, rl)| {
+            let absolute = start + i;
+            highlight_matches(&rl.line, absolute, active_matches)
+        })
+        .collect()
+}
+
+/// Overlay search-match highlights on a single rendered line.
+///
+/// Walks `line`'s existing spans, splitting any that intersect a match
+/// range into before/middle/after pieces. Match pieces get an inverted
+/// `on_yellow / black` style; everything else preserves its original
+/// styling. Runs over at most one viewport's worth of lines per frame,
+/// so the per-line O(spans × matches) cost is fine.
+fn highlight_matches(
+    line: &Line<'static>,
+    line_idx: usize,
+    matches: &[SearchMatch],
+) -> Line<'static> {
+    let line_matches: Vec<&SearchMatch> = matches.iter().filter(|m| m.line == line_idx).collect();
+    if line_matches.is_empty() {
+        return line.clone();
+    }
+    let highlight = Style::new().bg(Color::Yellow).fg(Color::Black);
+    let mut out_spans: Vec<Span<'static>> = Vec::with_capacity(line.spans.len());
+    let mut cursor = 0usize;
+    for span in &line.spans {
+        let span_len = span.content.len();
+        let span_start = cursor;
+        let span_end = cursor + span_len;
+        // Collect all matches that overlap this span.
+        let mut slice_start = 0usize;
+        let mut overlaps: Vec<(usize, usize)> = line_matches
+            .iter()
+            .filter_map(|m| {
+                let s = m.byte_start.max(span_start);
+                let e = m.byte_end.min(span_end);
+                if s < e {
+                    Some((s - span_start, e - span_start))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        overlaps.sort_by_key(|o| o.0);
+        if overlaps.is_empty() {
+            out_spans.push(span.clone());
+        } else {
+            let text = span.content.as_ref();
+            let base_style = span.style;
+            for (ms, me) in overlaps {
+                if ms > slice_start {
+                    out_spans.push(Span::styled(text[slice_start..ms].to_string(), base_style));
+                }
+                out_spans.push(Span::styled(text[ms..me].to_string(), highlight));
+                slice_start = me;
+            }
+            if slice_start < span_len {
+                out_spans.push(Span::styled(
+                    text[slice_start..span_len].to_string(),
+                    base_style,
+                ));
+            }
+        }
+        cursor = span_end;
+    }
+    Line::from(out_spans)
 }
 
 fn build_status(state: &TranscriptState) -> Line<'static> {
-    // Flash messages (toggled by `t`/`T`/`{`/`}` failures, etc.) take
-    // precedence over the default session counters so the user sees why
-    // nothing appeared to happen.
+    // Typing-mode search takes priority so the user sees the live query.
+    if let SearchMode::Typing { query } = state.search_mode() {
+        return Line::from(vec![
+            Span::styled("/", Style::new().fg(Color::Yellow).bold()),
+            Span::raw(query.clone()),
+        ]);
+    }
+    // Flash messages (toggled by `t`/`T`/`{`/`}`/search failures, etc.)
+    // take precedence over the default session counters so the user
+    // sees why nothing appeared to happen.
     if let Some(flash) = state.flash() {
         return Line::from(Span::styled(
             format!("⚠ {flash}"),
-            Style::new().fg(ratatui::style::Color::Yellow),
+            Style::new().fg(Color::Yellow),
         ));
     }
     let t = state.transcript();

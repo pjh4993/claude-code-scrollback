@@ -40,16 +40,8 @@ fn main() -> Result<()> {
     let _log_guard = logging::init(cli.log_level.as_deref(), cli.log_format)?;
 
     let initial = match (cli.live, cli.session) {
-        (true, _) => Screen::Viewer {
-            live: true,
-            session: None,
-            state: None,
-        },
-        (false, Some(target)) => Screen::Viewer {
-            live: false,
-            session: resolve_session_target(&target)?,
-            state: None,
-        },
+        (true, _) => Screen::viewer(true, None),
+        (false, Some(target)) => Screen::viewer(false, resolve_session_target(&target)?),
         (false, None) => Screen::Picker(build_picker()?),
     };
 
