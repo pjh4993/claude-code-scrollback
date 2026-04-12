@@ -10,6 +10,7 @@ name = "claude-code-scrollback"
 path = "src/main.rs"
 
 [dependencies]
+ccs-core.workspace = true
 ccs-tui.workspace = true
 
 anyhow.workspace = true
