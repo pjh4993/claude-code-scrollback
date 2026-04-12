@@ -14,6 +14,15 @@ dirs.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "discover"
+harness = false
+
+[[bench]]
+name = "tail"
+harness = false
 
 [lints]
 workspace = true
