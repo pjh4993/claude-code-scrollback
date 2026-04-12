@@ -5,6 +5,7 @@
 //! the user's cache directory; `RUST_LOG` and the CLI flags decide verbosity
 //! and format.
 
+use std::io::IsTerminal;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
@@ -55,7 +56,9 @@ pub fn init(level: Option<&str>, format: LogFormat) -> Result<WorkerGuard> {
     };
 
     // Stderr is best-effort: only emit WARN+ so it doesn't mangle the TUI,
-    // and only when stderr is not a tty (e.g. the user redirected 2> file).
+    // and only when stderr is redirected — a live tty would splat onto the
+    // alternate screen buffer.
+    let stderr_redirected = !std::io::stderr().is_terminal();
     let stderr_writer = std::io::stderr.with_max_level(tracing::Level::WARN);
 
     let registry = tracing_subscriber::registry().with(filter);
@@ -63,12 +66,14 @@ pub fn init(level: Option<&str>, format: LogFormat) -> Result<WorkerGuard> {
     match format {
         LogFormat::Text => {
             let file_layer = fmt::layer().with_ansi(false).with_writer(file_writer);
-            let stderr_layer = fmt::layer().with_ansi(false).with_writer(stderr_writer);
+            let stderr_layer =
+                stderr_redirected.then(|| fmt::layer().with_ansi(false).with_writer(stderr_writer));
             registry.with(file_layer).with(stderr_layer).init();
         }
         LogFormat::Json => {
             let file_layer = fmt::layer().json().with_writer(file_writer);
-            let stderr_layer = fmt::layer().json().with_writer(stderr_writer);
+            let stderr_layer =
+                stderr_redirected.then(|| fmt::layer().json().with_writer(stderr_writer));
             registry.with(file_layer).with(stderr_layer).init();
         }
     }
