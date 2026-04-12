@@ -288,7 +288,11 @@ mod tests {
         let proj = root.join("-Users-alice-claude-code-scrollback");
         fs::create_dir_all(&proj).unwrap();
         let mut f = File::create(proj.join("sess.jsonl")).unwrap();
-        writeln!(f, r#"{{"type":"permission-mode","permissionMode":"default"}}"#).unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"permission-mode","permissionMode":"default"}}"#
+        )
+        .unwrap();
         writeln!(
             f,
             r#"{{"type":"user","uuid":"u","sessionId":"s","timestamp":"t","cwd":"/Users/alice/claude-code-scrollback","message":{{"role":"user","content":"hi"}}}}"#
