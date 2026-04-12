@@ -157,7 +157,12 @@ fn collect_subagents(
     }
 }
 
-/// Return sessions whose `project_cwd` is an ancestor of, or equal to, `cwd`.
+/// Return sessions whose `project_cwd` overlaps with `cwd` — either path may
+/// be an ancestor of the other, or they may be equal. The bidirectional
+/// prefix match is deliberate: a picker launched from a sub-directory of a
+/// tracked project should still surface that project's sessions, and a
+/// picker launched from an ancestor directory should surface every nested
+/// project's sessions.
 ///
 /// Because [`decode_project_dir`] is lossy, this is a prefix match on the
 /// decoded path rather than a strict equality check.
