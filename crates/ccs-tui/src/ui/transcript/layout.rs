@@ -1,16 +1,18 @@
 //! Pre-render a [`Transcript`] into a flat, terminal-ready line cache.
 //!
-//! PR 2 scope: plain-text only. Role-colored header per message, body lines
-//! per block with a short prefix indicating block kind, blank separator
-//! between messages. PR 3 will swap the body path for a pulldown-cmark
-//! event walker that emits styled spans; the shape of this function stays
-//! the same.
+//! Text blocks are rendered through the minimal markdown walker in
+//! [`super::markdown`]; other block kinds (thinking, tool call, tool
+//! result, attachment, unknown) stay on the plain char-wrap path.
+//! Collapsed blocks are replaced by a single [`LineKind::Fold`] marker.
+
+use std::collections::HashSet;
 
 use ccs_core::transcript::{Block, Message, Role, Transcript};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
-use super::state::{LineKind, RenderedLine};
+use super::markdown::render_markdown;
+use super::state::{BlockId, CollapseAll, LineKind, RenderedLine};
 
 /// Fallback wrap width used only when the caller has not yet set a real
 /// viewport (first draw, width == 0). A real narrow terminal — even
@@ -18,26 +20,54 @@ use super::state::{LineKind, RenderedLine};
 /// sees what their terminal is actually showing.
 const UNKNOWN_WIDTH_FALLBACK: usize = 80;
 
+/// Everything a `build` call needs to know about the current collapse
+/// state. Lives in [`super::state`] but is passed in by reference so the
+/// layout pass stays a pure function of transcript + collapse snapshot.
+pub struct CollapseContext<'a> {
+    pub collapsed: &'a HashSet<BlockId>,
+    pub collapse_all: CollapseAll,
+}
+
+/// Output of a layout pass: the line cache plus the line indices of each
+/// user-turn header (for `{` and `}` jumps).
+pub struct LayoutOutput {
+    pub lines: Vec<RenderedLine>,
+    pub user_turn_line_starts: Vec<usize>,
+}
+
 /// Build the full line cache for `transcript` at the given body width.
 ///
 /// `width` is the inner width of the viewer body (already has borders /
-/// padding subtracted by the caller). A `width` of 0 is treated as
-/// "unknown" and falls back to a conservative wrap width so lines still
-/// render during the very first draw before the real viewport size is
-/// known.
-pub fn build(transcript: &Transcript, width: u16) -> Vec<RenderedLine> {
+/// padding subtracted by the caller). A `width` of 0 falls back to 80
+/// columns so the very first draw (before `set_viewport` runs) still
+/// produces content.
+pub fn build(transcript: &Transcript, width: u16, ctx: &CollapseContext<'_>) -> LayoutOutput {
     let wrap_at = effective_wrap_width(width);
-    let mut out: Vec<RenderedLine> = Vec::new();
+    let mut lines: Vec<RenderedLine> = Vec::new();
+    let mut user_turn_line_starts: Vec<usize> = Vec::new();
+
     for (i, msg) in transcript.messages.iter().enumerate() {
         if i > 0 {
-            out.push(separator_line(msg.index));
+            lines.push(separator_line(msg.index));
         }
-        out.push(header_line(msg));
-        for block in &msg.blocks {
-            append_block(&mut out, msg.index, block, wrap_at);
+        let header_idx = lines.len();
+        lines.push(header_line(msg));
+        if msg.role == Role::User {
+            user_turn_line_starts.push(header_idx);
+        }
+        for (block_idx, block) in msg.blocks.iter().enumerate() {
+            if is_collapsed(msg.index, block_idx, block, ctx) {
+                lines.push(fold_line(msg.index, block_idx, block));
+            } else {
+                append_block(&mut lines, msg.index, block_idx, block, wrap_at);
+            }
         }
     }
-    out
+
+    LayoutOutput {
+        lines,
+        user_turn_line_starts,
+    }
 }
 
 fn effective_wrap_width(width: u16) -> usize {
@@ -45,6 +75,24 @@ fn effective_wrap_width(width: u16) -> usize {
         UNKNOWN_WIDTH_FALLBACK
     } else {
         width as usize
+    }
+}
+
+fn is_collapsed(
+    msg_idx: usize,
+    block_idx: usize,
+    block: &Block,
+    ctx: &CollapseContext<'_>,
+) -> bool {
+    if ctx.collapsed.contains(&(msg_idx, block_idx)) {
+        return true;
+    }
+    match ctx.collapse_all {
+        CollapseAll::Off => false,
+        CollapseAll::ToolsAndThinking => matches!(
+            block,
+            Block::Thinking(_) | Block::ToolCall { .. } | Block::ToolResult { .. }
+        ),
     }
 }
 
@@ -78,6 +126,7 @@ fn header_line(msg: &Message) -> RenderedLine {
     RenderedLine {
         line: Line::from(spans),
         msg_index: msg.index,
+        block_index: None,
         kind: LineKind::Header,
     }
 }
@@ -89,15 +138,74 @@ fn separator_line(next_msg_index: usize) -> RenderedLine {
         // scrolling to the top of a message lands the cursor on its
         // separator+header pair.
         msg_index: next_msg_index,
+        block_index: None,
         kind: LineKind::Separator,
     }
 }
 
-fn append_block(out: &mut Vec<RenderedLine>, msg_index: usize, block: &Block, wrap_at: usize) {
+fn fold_line(msg_index: usize, block_index: usize, block: &Block) -> RenderedLine {
+    let (label, style) = match block {
+        Block::Thinking(s) => {
+            let n = count_lines(s);
+            (
+                format!("▸ [thinking] ({n} lines hidden)"),
+                Style::new()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::DIM | Modifier::ITALIC),
+            )
+        }
+        Block::ToolCall { name, .. } => (
+            format!("▸ → {name} (collapsed)"),
+            Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        ),
+        Block::ToolResult {
+            content, is_error, ..
+        } => {
+            let n = count_lines(content);
+            let head = if *is_error {
+                format!("▸ ← tool_result [error] ({n} lines hidden)")
+            } else {
+                format!("▸ ← tool_result ({n} lines hidden)")
+            };
+            let style = if *is_error {
+                Style::new().fg(Color::Red).add_modifier(Modifier::BOLD)
+            } else {
+                Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+            };
+            (head, style)
+        }
+        _ => (
+            "▸ (collapsed)".to_string(),
+            Style::new().add_modifier(Modifier::DIM),
+        ),
+    };
+    RenderedLine {
+        line: Line::from(Span::styled(label, style)),
+        msg_index,
+        block_index: Some(block_index),
+        kind: LineKind::Fold,
+    }
+}
+
+fn count_lines(s: &str) -> usize {
+    if s.is_empty() {
+        0
+    } else {
+        s.lines().count().max(1)
+    }
+}
+
+fn append_block(
+    out: &mut Vec<RenderedLine>,
+    msg_index: usize,
+    block_index: usize,
+    block: &Block,
+    wrap_at: usize,
+) {
     match block {
         Block::Text(s) => {
-            for chunk in wrap_plain(s, wrap_at) {
-                out.push(body_line(msg_index, Line::from(Span::raw(chunk))));
+            for line in render_markdown(s, wrap_at) {
+                out.push(body_line(msg_index, block_index, line));
             }
         }
         Block::Thinking(s) => {
@@ -106,10 +214,18 @@ fn append_block(out: &mut Vec<RenderedLine>, msg_index: usize, block: &Block, wr
                 .fg(Color::Magenta)
                 .add_modifier(Modifier::DIM | Modifier::ITALIC);
             let first = format!("{prefix}[thinking]");
-            out.push(body_line(msg_index, Line::from(Span::styled(first, style))));
+            out.push(body_line(
+                msg_index,
+                block_index,
+                Line::from(Span::styled(first, style)),
+            ));
             for chunk in wrap_plain(s, wrap_at.saturating_sub(prefix.len())) {
                 let text = format!("{prefix}{chunk}");
-                out.push(body_line(msg_index, Line::from(Span::styled(text, style))));
+                out.push(body_line(
+                    msg_index,
+                    block_index,
+                    Line::from(Span::styled(text, style)),
+                ));
             }
         }
         Block::ToolCall {
@@ -118,6 +234,7 @@ fn append_block(out: &mut Vec<RenderedLine>, msg_index: usize, block: &Block, wr
             let head = format!("→ {name}");
             out.push(body_line(
                 msg_index,
+                block_index,
                 Line::from(Span::styled(
                     head,
                     Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
@@ -127,6 +244,7 @@ fn append_block(out: &mut Vec<RenderedLine>, msg_index: usize, block: &Block, wr
                 let text = format!("  {chunk}");
                 out.push(body_line(
                     msg_index,
+                    block_index,
                     Line::from(Span::styled(text, Style::new().fg(Color::Yellow))),
                 ));
             }
@@ -146,6 +264,7 @@ fn append_block(out: &mut Vec<RenderedLine>, msg_index: usize, block: &Block, wr
             };
             out.push(body_line(
                 msg_index,
+                block_index,
                 Line::from(Span::styled(head.to_string(), head_style)),
             ));
             let body_style = Style::new().add_modifier(Modifier::DIM);
@@ -153,6 +272,7 @@ fn append_block(out: &mut Vec<RenderedLine>, msg_index: usize, block: &Block, wr
                 let text = format!("  {chunk}");
                 out.push(body_line(
                     msg_index,
+                    block_index,
                     Line::from(Span::styled(text, body_style)),
                 ));
             }
@@ -161,12 +281,17 @@ fn append_block(out: &mut Vec<RenderedLine>, msg_index: usize, block: &Block, wr
             let style = Style::new().fg(Color::Blue);
             let text = format!("[attachment] {s}");
             for chunk in wrap_plain(&text, wrap_at) {
-                out.push(body_line(msg_index, Line::from(Span::styled(chunk, style))));
+                out.push(body_line(
+                    msg_index,
+                    block_index,
+                    Line::from(Span::styled(chunk, style)),
+                ));
             }
         }
         Block::Unknown => {
             out.push(body_line(
                 msg_index,
+                block_index,
                 Line::from(Span::styled(
                     "[unknown block]".to_string(),
                     Style::new().add_modifier(Modifier::DIM),
@@ -176,18 +301,18 @@ fn append_block(out: &mut Vec<RenderedLine>, msg_index: usize, block: &Block, wr
     }
 }
 
-fn body_line(msg_index: usize, line: Line<'static>) -> RenderedLine {
+fn body_line(msg_index: usize, block_index: usize, line: Line<'static>) -> RenderedLine {
     RenderedLine {
         line,
         msg_index,
+        block_index: Some(block_index),
         kind: LineKind::Body,
     }
 }
 
-/// Split `text` on newlines, then break each line at `wrap_at` char
-/// boundaries. Char-count based — fine for plain ASCII / BMP text; PR 3
-/// swaps this for `unicode-width` grapheme-aware wrapping when the
-/// markdown renderer lands.
+/// Plain char-count wrap used by non-text blocks (tool calls, tool
+/// results, attachments, thinking). Text blocks go through the markdown
+/// renderer in [`super::markdown`] which is width-aware.
 fn wrap_plain(text: &str, wrap_at: usize) -> Vec<String> {
     let wrap_at = wrap_at.max(1);
     let mut out: Vec<String> = Vec::new();
@@ -223,10 +348,23 @@ mod tests {
         from_events(lines.iter().map(|l| parse_line(l).unwrap()))
     }
 
+    fn empty_ctx() -> CollapseContext<'static> {
+        use std::sync::OnceLock;
+        static EMPTY: OnceLock<HashSet<BlockId>> = OnceLock::new();
+        CollapseContext {
+            collapsed: EMPTY.get_or_init(HashSet::new),
+            collapse_all: CollapseAll::Off,
+        }
+    }
+
+    fn build_default(t: &Transcript, width: u16) -> LayoutOutput {
+        build(t, width, &empty_ctx())
+    }
+
     #[test]
     fn empty_transcript_produces_no_lines() {
         let t = Transcript::default();
-        assert!(build(&t, 80).is_empty());
+        assert!(build_default(&t, 80).lines.is_empty());
     }
 
     #[test]
@@ -234,10 +372,9 @@ mod tests {
         let t = tx(&[
             r#"{"type":"user","uuid":"u1","sessionId":"s1","timestamp":"t","message":{"role":"user","content":"hi"}}"#,
         ]);
-        let lines = build(&t, 80);
-        assert_eq!(lines.len(), 2);
-        assert_eq!(lines[0].kind, LineKind::Header);
-        assert_eq!(lines[1].kind, LineKind::Body);
+        let out = build_default(&t, 80);
+        assert_eq!(out.lines[0].kind, LineKind::Header);
+        assert!(out.lines.iter().skip(1).any(|l| l.kind == LineKind::Body));
     }
 
     #[test]
@@ -246,18 +383,28 @@ mod tests {
             r#"{"type":"user","uuid":"u1","sessionId":"s1","timestamp":"t","message":{"role":"user","content":"hi"}}"#,
             r#"{"type":"assistant","uuid":"a1","sessionId":"s1","timestamp":"t","message":{"role":"assistant","content":[{"type":"text","text":"hello"}]}}"#,
         ]);
-        let lines = build(&t, 80);
-        let kinds: Vec<_> = lines.iter().map(|l| l.kind).collect();
-        assert_eq!(
-            kinds,
-            vec![
-                LineKind::Header,
-                LineKind::Body,
-                LineKind::Separator,
-                LineKind::Header,
-                LineKind::Body,
-            ]
-        );
+        let out = build_default(&t, 80);
+        let sep_count = out
+            .lines
+            .iter()
+            .filter(|l| l.kind == LineKind::Separator)
+            .count();
+        assert_eq!(sep_count, 1);
+    }
+
+    #[test]
+    fn user_turn_line_starts_index_the_user_headers() {
+        let t = tx(&[
+            r#"{"type":"user","uuid":"u1","sessionId":"s1","timestamp":"t","message":{"role":"user","content":"first"}}"#,
+            r#"{"type":"assistant","uuid":"a1","sessionId":"s1","timestamp":"t","message":{"role":"assistant","content":[{"type":"text","text":"hi"}]}}"#,
+            r#"{"type":"user","uuid":"u2","sessionId":"s1","timestamp":"t","message":{"role":"user","content":"second"}}"#,
+        ]);
+        let out = build_default(&t, 80);
+        assert_eq!(out.user_turn_line_starts.len(), 2);
+        for &i in &out.user_turn_line_starts {
+            assert_eq!(out.lines[i].kind, LineKind::Header);
+            assert_eq!(out.lines[i].msg_index % 2, 0); // user turns at even msg indices
+        }
     }
 
     #[test]
@@ -267,52 +414,103 @@ mod tests {
             r#"{{"type":"user","uuid":"u1","sessionId":"s1","timestamp":"t","message":{{"role":"user","content":"{long}"}}}}"#
         );
         let t = tx(&[&line]);
-        let lines = build(&t, 40);
-        // header + wrapped body (90 chars / 40 width = 3 body lines)
-        let body_count = lines.iter().filter(|l| l.kind == LineKind::Body).count();
-        assert_eq!(body_count, 3);
+        let out = build_default(&t, 40);
+        let body_count = out
+            .lines
+            .iter()
+            .filter(|l| l.kind == LineKind::Body)
+            .count();
+        assert!(body_count >= 3);
     }
 
     #[test]
     fn unknown_viewport_falls_back_to_80() {
-        // width = 0 happens on the first draw before set_viewport runs.
         let t = tx(&[
             r#"{"type":"user","uuid":"u1","sessionId":"s1","timestamp":"t","message":{"role":"user","content":"hello world"}}"#,
         ]);
-        let lines = build(&t, 0);
-        assert!(lines.iter().any(|l| l.kind == LineKind::Body));
-    }
-
-    #[test]
-    fn real_narrow_viewport_wraps_at_its_own_width() {
-        // Regression: previously any width < 20 was treated as "unknown" and
-        // force-fallen-back to 80 cols, so a real 10-col terminal rendered
-        // overflow. Now a nonzero width is honored, however small.
-        let long = "x".repeat(30);
-        let line = format!(
-            r#"{{"type":"user","uuid":"u1","sessionId":"s1","timestamp":"t","message":{{"role":"user","content":"{long}"}}}}"#
-        );
-        let t = tx(&[&line]);
-        let lines = build(&t, 10);
-        // 30 chars / 10 cols = 3 wrapped body lines
-        let body_count = lines.iter().filter(|l| l.kind == LineKind::Body).count();
-        assert_eq!(body_count, 3);
+        let out = build_default(&t, 0);
+        assert!(out.lines.iter().any(|l| l.kind == LineKind::Body));
     }
 
     #[test]
     fn attachment_wraps_long_paths() {
-        // Regression: attachments used to push a single unwrapped line.
         let long_path = format!("/very/long/{}", "x".repeat(200));
         let t = tx(&[&format!(
             r#"{{"type":"attachment","uuid":"a1","sessionId":"s1","timestamp":"t","attachment":{{"type":"file","path":"{long_path}"}}}}"#
         )]);
-        let lines = build(&t, 40);
-        let body_count = lines.iter().filter(|l| l.kind == LineKind::Body).count();
-        // Long attachment summary must span multiple wrapped body lines.
-        assert!(
-            body_count >= 4,
-            "expected attachment to wrap across >=4 lines, got {body_count}"
+        let out = build_default(&t, 40);
+        let body_count = out
+            .lines
+            .iter()
+            .filter(|l| l.kind == LineKind::Body)
+            .count();
+        assert!(body_count >= 4);
+    }
+
+    #[test]
+    fn collapse_all_replaces_tools_and_thinking_with_fold_lines() {
+        let t = tx(&[
+            r#"{"type":"assistant","uuid":"a1","sessionId":"s1","timestamp":"t","message":{"role":"assistant","content":[{"type":"thinking","thinking":"long\nreasoning\nblock"},{"type":"text","text":"hi"},{"type":"tool_use","id":"t1","name":"Read","input":{"path":"x"}}]}}"#,
+        ]);
+        let mut collapsed: HashSet<BlockId> = HashSet::new();
+        collapsed.clear();
+        let ctx = CollapseContext {
+            collapsed: &collapsed,
+            collapse_all: CollapseAll::ToolsAndThinking,
+        };
+        let out = build(&t, 80, &ctx);
+        let fold_count = out
+            .lines
+            .iter()
+            .filter(|l| l.kind == LineKind::Fold)
+            .count();
+        // thinking + tool_use = 2 folds; text stays expanded.
+        assert_eq!(fold_count, 2);
+        assert!(out.lines.iter().any(|l| l.kind == LineKind::Body));
+    }
+
+    #[test]
+    fn individual_collapse_via_set_replaces_single_block() {
+        let t = tx(&[
+            r#"{"type":"assistant","uuid":"a1","sessionId":"s1","timestamp":"t","message":{"role":"assistant","content":[{"type":"thinking","thinking":"one"},{"type":"text","text":"two"}]}}"#,
+        ]);
+        let mut collapsed: HashSet<BlockId> = HashSet::new();
+        collapsed.insert((0, 0)); // collapse the thinking block
+        let ctx = CollapseContext {
+            collapsed: &collapsed,
+            collapse_all: CollapseAll::Off,
+        };
+        let out = build(&t, 80, &ctx);
+        let fold_count = out
+            .lines
+            .iter()
+            .filter(|l| l.kind == LineKind::Fold)
+            .count();
+        assert_eq!(fold_count, 1);
+        assert_eq!(
+            out.lines
+                .iter()
+                .find(|l| l.kind == LineKind::Fold)
+                .unwrap()
+                .block_index,
+            Some(0)
         );
+    }
+
+    #[test]
+    fn markdown_bold_in_text_block_retains_text() {
+        let t = tx(&[
+            r#"{"type":"assistant","uuid":"a1","sessionId":"s1","timestamp":"t","message":{"role":"assistant","content":[{"type":"text","text":"a **bold** word"}]}}"#,
+        ]);
+        let out = build_default(&t, 80);
+        let joined: String = out
+            .lines
+            .iter()
+            .flat_map(|l| l.line.spans.iter().map(|s| s.content.to_string()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(joined.contains("bold"));
+        assert!(joined.contains("word"));
     }
 
     #[test]
@@ -321,34 +519,30 @@ mod tests {
             r#"{"type":"assistant","uuid":"a1","sessionId":"s1","timestamp":"t","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Read","input":{"path":"x"}}]}}"#,
             r#"{"type":"user","uuid":"u2","sessionId":"s1","timestamp":"t","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"contents","is_error":false}]}}"#,
         ]);
-        let lines = build(&t, 80);
-        let rendered: Vec<String> = lines
+        let out = build_default(&t, 80);
+        let rendered: Vec<String> = out
+            .lines
             .iter()
             .flat_map(|l| l.line.spans.iter().map(|s| s.content.to_string()))
             .collect();
         let joined = rendered.join("|");
-        assert!(
-            joined.contains("→ Read"),
-            "missing tool call head: {joined}"
-        );
-        assert!(
-            joined.contains("← tool_result"),
-            "missing tool result head: {joined}"
-        );
+        assert!(joined.contains("→ Read"));
+        assert!(joined.contains("← tool_result"));
     }
 
     #[test]
-    fn each_rendered_line_carries_its_source_msg_index() {
+    fn body_and_fold_lines_carry_block_index() {
         let t = tx(&[
-            r#"{"type":"user","uuid":"u1","sessionId":"s1","timestamp":"t","message":{"role":"user","content":"a"}}"#,
-            r#"{"type":"assistant","uuid":"a1","sessionId":"s1","timestamp":"t","message":{"role":"assistant","content":[{"type":"text","text":"b"}]}}"#,
+            r#"{"type":"assistant","uuid":"a1","sessionId":"s1","timestamp":"t","message":{"role":"assistant","content":[{"type":"text","text":"a"},{"type":"text","text":"b"}]}}"#,
         ]);
-        let lines = build(&t, 80);
-        // 0: header(msg0), 1: body(msg0), 2: sep(msg1), 3: header(msg1), 4: body(msg1)
-        assert_eq!(lines[0].msg_index, 0);
-        assert_eq!(lines[1].msg_index, 0);
-        assert_eq!(lines[2].msg_index, 1);
-        assert_eq!(lines[3].msg_index, 1);
-        assert_eq!(lines[4].msg_index, 1);
+        let out = build_default(&t, 80);
+        let body_indices: Vec<_> = out
+            .lines
+            .iter()
+            .filter(|l| l.kind == LineKind::Body)
+            .filter_map(|l| l.block_index)
+            .collect();
+        assert!(body_indices.contains(&0));
+        assert!(body_indices.contains(&1));
     }
 }

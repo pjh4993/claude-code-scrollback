@@ -17,16 +17,21 @@ pub enum Action {
 
 /// Consume a `KeyEvent` and mutate `state` accordingly.
 ///
-/// Vim keys implemented in PR 2:
-/// * `j` / `k` / `↓` / `↑`       — line down / up
-/// * `Ctrl-d` / `Ctrl-u`        — half-page down / up
+/// * `j` / `k` / `↓` / `↑`        — line down / up
+/// * `Ctrl-d` / `Ctrl-u`          — half-page down / up
 /// * `g g` / `G` / `Home` / `End` — jump to top / bottom
-/// * `q` / `Esc`                 — quit
+/// * `{` / `}`                    — prev / next user turn
+/// * `t`                          — toggle collapse on block under cursor
+/// * `T`                          — cycle collapse-all (tools & thinking)
+/// * `q` / `Esc`                  — quit
 pub fn handle_key(state: &mut TranscriptState, key: KeyEvent) -> Action {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let pending_g = state.pending_g();
-    // Every keypress clears the gg chord unless it's the second g.
+    // Every keypress clears the gg chord unless it's the second g, and
+    // clears the last flash so stale "not collapsible" messages don't
+    // stick around forever.
     state.set_pending_g(false);
+    state.clear_flash();
 
     match key.code {
         KeyCode::Char('q') | KeyCode::Esc => Action::Quit,
@@ -63,6 +68,24 @@ pub fn handle_key(state: &mut TranscriptState, key: KeyEvent) -> Action {
             } else {
                 state.set_pending_g(true);
             }
+            Action::None
+        }
+
+        KeyCode::Char('{') => {
+            state.jump_prev_user_turn();
+            Action::None
+        }
+        KeyCode::Char('}') => {
+            state.jump_next_user_turn();
+            Action::None
+        }
+
+        KeyCode::Char('t') => {
+            state.toggle_current_block();
+            Action::None
+        }
+        KeyCode::Char('T') => {
+            state.toggle_collapse_all();
             Action::None
         }
 
@@ -165,5 +188,98 @@ mod tests {
             handle_key(&mut s, key(KeyCode::Char('k')));
         }
         assert_eq!(s.cursor(), 0);
+    }
+
+    fn state_with_tooling() -> TranscriptState {
+        let lines = &[
+            r#"{"type":"user","uuid":"u1","sessionId":"s1","timestamp":"t","message":{"role":"user","content":"q"}}"#,
+            r#"{"type":"assistant","uuid":"a1","sessionId":"s1","timestamp":"t","message":{"role":"assistant","content":[{"type":"thinking","thinking":"hm"},{"type":"text","text":"result"},{"type":"tool_use","id":"t1","name":"Read","input":{"path":"x"}}]}}"#,
+            r#"{"type":"user","uuid":"u2","sessionId":"s1","timestamp":"t","message":{"role":"user","content":"next"}}"#,
+        ];
+        let t: Transcript = from_events(lines.iter().map(|l| parse_line(l).unwrap()));
+        let mut s = TranscriptState::new(t);
+        s.set_viewport(80, 20);
+        s
+    }
+
+    #[test]
+    fn capital_t_cycles_collapse_all_and_sets_flash() {
+        use crate::ui::transcript::state::{CollapseAll, LineKind};
+        let mut s = state_with_tooling();
+        handle_key(&mut s, key(KeyCode::Char('T')));
+        assert_eq!(s.collapse_all(), CollapseAll::ToolsAndThinking);
+        assert!(s.flash().is_some());
+        let fold_count = s
+            .lines()
+            .iter()
+            .filter(|l| l.kind == LineKind::Fold)
+            .count();
+        assert!(
+            fold_count >= 2,
+            "expected tool+thinking folds, got {fold_count}"
+        );
+
+        handle_key(&mut s, key(KeyCode::Char('T')));
+        assert_eq!(s.collapse_all(), CollapseAll::Off);
+        let fold_count = s
+            .lines()
+            .iter()
+            .filter(|l| l.kind == LineKind::Fold)
+            .count();
+        assert_eq!(fold_count, 0);
+    }
+
+    #[test]
+    fn t_on_text_block_sets_not_collapsible_flash() {
+        let mut s = state_with_tooling();
+        // Navigate until the cursor lands on a Body line for a Text block.
+        for _ in 0..50 {
+            if let Some(rl) = s.lines().get(s.cursor()) {
+                use crate::ui::transcript::state::LineKind;
+                if rl.kind == LineKind::Body {
+                    if let Some(bi) = rl.block_index {
+                        let msg = &s.transcript().messages[rl.msg_index];
+                        if matches!(msg.blocks[bi], ccs_core::transcript::Block::Text(_)) {
+                            break;
+                        }
+                    }
+                }
+            }
+            handle_key(&mut s, key(KeyCode::Char('j')));
+        }
+        handle_key(&mut s, key(KeyCode::Char('t')));
+        assert_eq!(s.flash(), Some("not collapsible"));
+    }
+
+    #[test]
+    fn close_brace_and_open_brace_jump_between_user_turns() {
+        let mut s = state_with_tooling();
+        // Start at first user header (line 0).
+        assert_eq!(s.cursor(), 0);
+        handle_key(&mut s, key(KeyCode::Char('}')));
+        let after_next = s.cursor();
+        assert!(after_next > 0, "}} should advance cursor");
+        // Line should be a user header at a different msg_index than the first.
+        let row = &s.lines()[after_next];
+        use crate::ui::transcript::state::LineKind;
+        assert_eq!(row.kind, LineKind::Header);
+        assert_ne!(row.msg_index, 0);
+        handle_key(&mut s, key(KeyCode::Char('{')));
+        assert_eq!(s.cursor(), 0);
+    }
+
+    #[test]
+    fn open_brace_at_top_flashes_no_previous() {
+        let mut s = state_with_tooling();
+        handle_key(&mut s, key(KeyCode::Char('{')));
+        assert_eq!(s.flash(), Some("no previous user turns"));
+    }
+
+    #[test]
+    fn flash_is_cleared_by_next_key() {
+        let mut s = state_with_tooling();
+        s.set_flash("probe");
+        handle_key(&mut s, key(KeyCode::Char('j')));
+        assert!(s.flash().is_none());
     }
 }

@@ -63,6 +63,15 @@ fn slice_visible(state: &TranscriptState, height: u16) -> Vec<Line<'static>> {
 }
 
 fn build_status(state: &TranscriptState) -> Line<'static> {
+    // Flash messages (toggled by `t`/`T`/`{`/`}` failures, etc.) take
+    // precedence over the default session counters so the user sees why
+    // nothing appeared to happen.
+    if let Some(flash) = state.flash() {
+        return Line::from(Span::styled(
+            format!("⚠ {flash}"),
+            Style::new().fg(ratatui::style::Color::Yellow),
+        ));
+    }
     let t = state.transcript();
     let total_msgs = t.messages.len();
     let current_msg = if total_msgs == 0 {

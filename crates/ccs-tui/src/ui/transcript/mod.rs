@@ -7,6 +7,7 @@
 
 pub mod keymap;
 pub mod layout;
+pub mod markdown;
 pub mod render;
 pub mod state;
 

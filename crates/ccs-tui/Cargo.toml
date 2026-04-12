@@ -18,6 +18,8 @@ crossterm.workspace = true
 nucleo.workspace = true
 notify.workspace = true
 tokio.workspace = true
+pulldown-cmark.workspace = true
+unicode-width.workspace = true
 
 [lints]
 workspace = true
