@@ -3,11 +3,20 @@ name = "ccs-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "claude-code-scrollback binary"
+repository.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+description = "Read-only TUI viewer for Claude Code session JSONLs — picker, transcript, live-tail, search, marks."
+readme = "../../README.md"
 
 [[bin]]
 name = "claude-code-scrollback"
 path = "src/main.rs"
+
+[dev-dependencies]
+tempfile = "3"
 
 [dependencies]
 ccs-core.workspace = true

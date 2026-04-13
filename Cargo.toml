@@ -11,6 +11,10 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/pjh4993/claude-code-scrollback"
+authors = ["pjh4993 <pjh4993@users.noreply.github.com>"]
+keywords = ["claude", "tui", "scrollback", "viewer", "session"]
+categories = ["command-line-utilities", "development-tools::debugging"]
+rust-version = "1.75"
 
 [workspace.dependencies]
 # shared

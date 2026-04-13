@@ -6,6 +6,7 @@ use ccs_core::session::{self, SessionFile, SessionKind};
 use ccs_tui::ui::picker::PickerState;
 use ccs_tui::{App, Screen};
 use clap::Parser;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -56,9 +57,30 @@ fn main() -> Result<()> {
             };
             Screen::viewer(true, session)
         }
-        (false, Some(target)) => Screen::viewer(false, resolve_session_target(&target)?),
+        (false, Some(target)) => {
+            // Non-live mode: a bad positional arg is a hard error too.
+            // Without this the empty `Screen::viewer(false, None)`
+            // opens, which initialises the TUI just to show "no
+            // session loaded" — worse than a one-line shell error.
+            let session = match resolve_session_target(&target)? {
+                Some(s) => Some(s),
+                None => anyhow::bail!("unknown session id or path: {target}"),
+            };
+            Screen::viewer(false, session)
+        }
         (false, None) => Screen::Picker(build_picker()?),
     };
+
+    // TUI requires a real terminal. Bail cleanly if we were piped or
+    // redirected — otherwise ratatui's init panics inside the
+    // alternate-screen-buffer sequence, which leaves the user's
+    // terminal in a bad state. First-run experience is one of
+    // PJH-53's success criteria; this keeps it clean.
+    if !std::io::stdout().is_terminal() {
+        anyhow::bail!(
+            "claude-code-scrollback requires an interactive terminal (stdout is not a TTY)"
+        );
+    }
 
     let mut terminal = ccs_tui::init();
     let result = App::new(initial).run(&mut terminal);
