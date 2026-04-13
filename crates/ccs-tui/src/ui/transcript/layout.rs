@@ -12,7 +12,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use super::markdown::render_markdown;
-use super::state::{BlockId, CollapseAll, LineKind, RenderedLine};
+use super::state::{BlockId, Checkpoint, CheckpointKind, CollapseAll, LineKind, RenderedLine};
 
 /// Fallback wrap width used only when the caller has not yet set a real
 /// viewport (first draw, width == 0). A real narrow terminal — even
@@ -29,10 +29,12 @@ pub struct CollapseContext<'a> {
 }
 
 /// Output of a layout pass: the line cache plus the line indices of each
-/// user-turn header (for `{` and `}` jumps).
+/// user-turn header (for `{` and `}` jumps) and the per-relayout list of
+/// auto-checkpoints driving the sidebar.
 pub struct LayoutOutput {
     pub lines: Vec<RenderedLine>,
     pub user_turn_line_starts: Vec<usize>,
+    pub checkpoints: Vec<Checkpoint>,
 }
 
 /// Build the full line cache for `transcript` at the given body width.
@@ -45,6 +47,7 @@ pub fn build(transcript: &Transcript, width: u16, ctx: &CollapseContext<'_>) -> 
     let wrap_at = effective_wrap_width(width);
     let mut lines: Vec<RenderedLine> = Vec::new();
     let mut user_turn_line_starts: Vec<usize> = Vec::new();
+    let mut checkpoints: Vec<Checkpoint> = Vec::new();
 
     for (i, msg) in transcript.messages.iter().enumerate() {
         if i > 0 {
@@ -54,6 +57,23 @@ pub fn build(transcript: &Transcript, width: u16, ctx: &CollapseContext<'_>) -> 
         lines.push(header_line(msg));
         if msg.role == Role::User {
             user_turn_line_starts.push(header_idx);
+            checkpoints.push(Checkpoint {
+                line: header_idx,
+                msg_index: msg.index,
+                kind: CheckpointKind::UserTurn,
+                preview: message_preview(msg),
+            });
+        }
+        if let Some(reason) = msg.stop_reason.as_ref() {
+            // System messages carrying a stopReason become Stop checkpoints
+            // at their own header line — that's where the user sees the
+            // `stop_reason=…` text today.
+            checkpoints.push(Checkpoint {
+                line: header_idx,
+                msg_index: msg.index,
+                kind: CheckpointKind::Stop(reason.clone()),
+                preview: format!("stop: {reason}"),
+            });
         }
         for (block_idx, block) in msg.blocks.iter().enumerate() {
             if is_collapsed(msg.index, block_idx, block, ctx) {
@@ -67,6 +87,36 @@ pub fn build(transcript: &Transcript, width: u16, ctx: &CollapseContext<'_>) -> 
     LayoutOutput {
         lines,
         user_turn_line_starts,
+        checkpoints,
+    }
+}
+
+/// One-line role-aware preview of a message for the sidebar list.
+/// Pulls the first text block (if any), collapses whitespace, and
+/// truncates. Falls back to the block kind when the message has no
+/// textual content (e.g. a pure tool-call turn).
+fn message_preview(msg: &Message) -> String {
+    const MAX: usize = 48;
+    let raw = msg
+        .blocks
+        .iter()
+        .find_map(|b| match b {
+            Block::Text(s) => Some(s.as_str()),
+            _ => None,
+        })
+        .unwrap_or_else(|| match msg.blocks.first() {
+            Some(Block::Thinking(_)) => "(thinking)",
+            Some(Block::ToolCall { name, .. }) => name.as_str(),
+            Some(Block::ToolResult { .. }) => "(tool result)",
+            Some(Block::Attachment(_)) => "(attachment)",
+            _ => "",
+        });
+    let collapsed: String = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() > MAX {
+        let truncated: String = collapsed.chars().take(MAX - 1).collect();
+        format!("{truncated}…")
+    } else {
+        collapsed
     }
 }
 
@@ -524,6 +574,66 @@ mod tests {
         let joined = rendered.join("|");
         assert!(joined.contains("→ Read"));
         assert!(joined.contains("← tool_result"));
+    }
+
+    #[test]
+    fn checkpoints_emit_one_user_turn_per_user_message() {
+        let t = tx(&[
+            r#"{"type":"user","uuid":"u1","sessionId":"s1","timestamp":"t","message":{"role":"user","content":"first"}}"#,
+            r#"{"type":"assistant","uuid":"a1","sessionId":"s1","timestamp":"t","message":{"role":"assistant","content":[{"type":"text","text":"hi"}]}}"#,
+            r#"{"type":"user","uuid":"u2","sessionId":"s1","timestamp":"t","message":{"role":"user","content":"second"}}"#,
+        ]);
+        let out = build_default(&t, 80);
+        let user_turns: Vec<_> = out
+            .checkpoints
+            .iter()
+            .filter(|c| matches!(c.kind, CheckpointKind::UserTurn))
+            .collect();
+        assert_eq!(user_turns.len(), 2);
+        assert_eq!(user_turns[0].preview, "first");
+        assert_eq!(user_turns[1].preview, "second");
+        // Every checkpoint line points at a real header row.
+        for cp in &out.checkpoints {
+            assert_eq!(out.lines[cp.line].kind, LineKind::Header);
+        }
+    }
+
+    #[test]
+    fn stop_reason_system_event_emits_stop_checkpoint() {
+        let t = tx(&[
+            r#"{"type":"user","uuid":"u1","sessionId":"s1","timestamp":"t","message":{"role":"user","content":"ask"}}"#,
+            r#"{"type":"assistant","uuid":"a1","sessionId":"s1","timestamp":"t","message":{"role":"assistant","content":[{"type":"text","text":"answer"}]}}"#,
+            r#"{"type":"system","uuid":"sys1","sessionId":"s1","timestamp":"t","stopReason":"end_turn"}"#,
+        ]);
+        let out = build_default(&t, 80);
+        let stops: Vec<_> = out
+            .checkpoints
+            .iter()
+            .filter_map(|c| match &c.kind {
+                CheckpointKind::Stop(r) => Some((c.line, r.clone(), c.preview.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(stops.len(), 1);
+        assert_eq!(stops[0].1, "end_turn");
+        assert_eq!(stops[0].2, "stop: end_turn");
+        assert_eq!(out.lines[stops[0].0].kind, LineKind::Header);
+    }
+
+    #[test]
+    fn checkpoints_are_sorted_by_line_so_prev_next_jumps_are_monotonic() {
+        let t = tx(&[
+            r#"{"type":"user","uuid":"u1","sessionId":"s1","timestamp":"t","message":{"role":"user","content":"q1"}}"#,
+            r#"{"type":"assistant","uuid":"a1","sessionId":"s1","timestamp":"t","message":{"role":"assistant","content":[{"type":"text","text":"a1"}]}}"#,
+            r#"{"type":"system","uuid":"sys1","sessionId":"s1","timestamp":"t","stopReason":"end_turn"}"#,
+            r#"{"type":"user","uuid":"u2","sessionId":"s1","timestamp":"t","message":{"role":"user","content":"q2"}}"#,
+        ]);
+        let out = build_default(&t, 80);
+        assert!(
+            out.checkpoints.windows(2).all(|w| w[0].line < w[1].line),
+            "checkpoints not strictly increasing: {:?}",
+            out.checkpoints.iter().map(|c| c.line).collect::<Vec<_>>()
+        );
     }
 
     #[test]

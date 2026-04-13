@@ -1,23 +1,39 @@
 //! Draw the transcript viewer: header, body, footer status line.
 
-use ratatui::layout::{Constraint, Layout};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
 
 use super::search::{SearchMatch, SearchMode};
-use super::state::TranscriptState;
+use super::state::{Checkpoint, CheckpointKind, TranscriptState};
+
+/// Fixed sidebar width when the checkpoint panel is visible. Picked
+/// to fit a short role label + a preview trimmed to ~24 cols without
+/// crowding a standard 80-col terminal.
+const SIDEBAR_WIDTH: u16 = 30;
 
 /// Render the transcript viewer into `frame`. Mutably borrows `state` so
 /// it can reflow the line cache on width changes.
 pub fn render(frame: &mut Frame, state: &mut TranscriptState, live: bool) {
-    let [header, body, footer] = Layout::vertical([
+    let [header, main, footer] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(0),
         Constraint::Length(1),
     ])
     .areas(frame.area());
+
+    // Split the main area horizontally when the sidebar is on. The
+    // sidebar is fixed-width; the body gets the remainder so the line
+    // cache can reflow to match whatever space is left.
+    let (body, sidebar) = if state.show_sidebar() && main.width > SIDEBAR_WIDTH + 2 {
+        let [b, s] =
+            Layout::horizontal([Constraint::Min(0), Constraint::Length(SIDEBAR_WIDTH)]).areas(main);
+        (b, Some(s))
+    } else {
+        (main, None)
+    };
 
     // Update state with the current body inner dimensions so the cache
     // matches the viewport. The bordered Block we draw below eats 2 cols
@@ -34,8 +50,59 @@ pub fn render(frame: &mut Frame, state: &mut TranscriptState, live: bool) {
         Paragraph::new(visible).block(Block::default().borders(Borders::ALL).title("messages"));
     frame.render_widget(body_widget, body);
 
+    if let Some(sidebar_area) = sidebar {
+        render_sidebar(frame, state, sidebar_area);
+    }
+
     let status = build_status(state);
     frame.render_widget(Paragraph::new(status).dim(), footer);
+}
+
+/// Draw the checkpoint sidebar as a bordered `List` whose selection
+/// follows the body cursor — the active row is whichever checkpoint
+/// is at-or-before the cursor line.
+fn render_sidebar(frame: &mut Frame, state: &TranscriptState, area: Rect) {
+    let items: Vec<ListItem<'static>> = state
+        .checkpoints()
+        .iter()
+        .map(|cp| ListItem::new(Line::from(checkpoint_spans(cp))))
+        .collect();
+
+    let mut list_state = ListState::default();
+    list_state.select(state.active_checkpoint_index());
+
+    let block = Block::default().borders(Borders::ALL).title("checkpoints");
+    if items.is_empty() {
+        let empty = Paragraph::new(Line::from(Span::styled(
+            "(no checkpoints)",
+            Style::new().add_modifier(Modifier::DIM),
+        )))
+        .block(block);
+        frame.render_widget(empty, area);
+        return;
+    }
+
+    let list = List::new(items)
+        .block(block)
+        .highlight_style(
+            Style::new()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("▸ ");
+    frame.render_stateful_widget(list, area, &mut list_state);
+}
+
+fn checkpoint_spans(cp: &Checkpoint) -> Vec<Span<'static>> {
+    let (label, color) = match &cp.kind {
+        CheckpointKind::UserTurn => ("user", Color::Cyan),
+        CheckpointKind::Stop(_) => ("stop", Color::Red),
+    };
+    vec![
+        Span::styled(format!("{label:<5}"), Style::new().fg(color).bold()),
+        Span::raw(" "),
+        Span::raw(cp.preview.clone()),
+    ]
 }
 
 fn build_title(state: &TranscriptState, live: bool) -> String {

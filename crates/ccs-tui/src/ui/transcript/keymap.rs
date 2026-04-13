@@ -24,6 +24,8 @@ pub enum Action {
 /// * `Ctrl-d` / `Ctrl-u`          — half-page down / up
 /// * `g g` / `G` / `Home` / `End` — jump to top / bottom
 /// * `{` / `}`                    — prev / next user turn
+/// * `[` / `]`                    — prev / next auto-checkpoint
+/// * `c`                          — toggle checkpoint sidebar
 /// * `m <letter>` / `' <letter>`  — set / jump to manual mark
 /// * `t`                          — toggle collapse on block under cursor
 /// * `T`                          — cycle collapse-all (tools & thinking)
@@ -110,6 +112,19 @@ pub fn handle_key(state: &mut TranscriptState, key: KeyEvent) -> Action {
         }
         KeyCode::Char('}') => {
             state.jump_next_user_turn();
+            Action::None
+        }
+
+        KeyCode::Char('[') => {
+            state.jump_prev_checkpoint();
+            Action::None
+        }
+        KeyCode::Char(']') => {
+            state.jump_next_checkpoint();
+            Action::None
+        }
+        KeyCode::Char('c') => {
+            state.toggle_sidebar();
             Action::None
         }
 
@@ -506,6 +521,94 @@ mod tests {
         s3.attach_marks_file(marks_path);
         assert!(s3.marks().contains_key(&'a'));
         assert!(s3.marks().contains_key(&'b'));
+    }
+
+    fn state_with_two_user_turns_and_a_stop() -> TranscriptState {
+        let lines = &[
+            r#"{"type":"user","uuid":"u1","sessionId":"s1","timestamp":"t","message":{"role":"user","content":"first"}}"#,
+            r#"{"type":"assistant","uuid":"a1","sessionId":"s1","timestamp":"t","message":{"role":"assistant","content":[{"type":"text","text":"answer 1"}]}}"#,
+            r#"{"type":"system","uuid":"sys1","sessionId":"s1","timestamp":"t","stopReason":"end_turn"}"#,
+            r#"{"type":"user","uuid":"u2","sessionId":"s1","timestamp":"t","message":{"role":"user","content":"second"}}"#,
+            r#"{"type":"assistant","uuid":"a2","sessionId":"s1","timestamp":"t","message":{"role":"assistant","content":[{"type":"text","text":"answer 2"}]}}"#,
+        ];
+        let t: Transcript = from_events(lines.iter().map(|l| parse_line(l).unwrap()));
+        let mut s = TranscriptState::new(t);
+        s.set_viewport(80, 20);
+        s
+    }
+
+    #[test]
+    fn c_toggles_the_sidebar() {
+        let mut s = state_with_two_user_turns_and_a_stop();
+        assert!(!s.show_sidebar());
+        handle_key(&mut s, key(KeyCode::Char('c')));
+        assert!(s.show_sidebar());
+        handle_key(&mut s, key(KeyCode::Char('c')));
+        assert!(!s.show_sidebar());
+    }
+
+    #[test]
+    fn close_bracket_advances_to_next_checkpoint() {
+        let mut s = state_with_two_user_turns_and_a_stop();
+        // There are 3 checkpoints: user1 (line 0), stop (mid), user2 (later).
+        assert!(s.checkpoints().len() >= 3);
+        assert_eq!(s.cursor(), 0);
+
+        handle_key(&mut s, key(KeyCode::Char(']')));
+        let after_one = s.cursor();
+        assert!(
+            after_one > 0,
+            "] should advance cursor past first checkpoint"
+        );
+        // Landing line must be one of the checkpoint lines.
+        assert!(s.checkpoints().iter().any(|c| c.line == after_one));
+
+        handle_key(&mut s, key(KeyCode::Char(']')));
+        let after_two = s.cursor();
+        assert!(after_two > after_one);
+    }
+
+    #[test]
+    fn open_bracket_steps_back_to_previous_checkpoint() {
+        let mut s = state_with_two_user_turns_and_a_stop();
+        // `G` lands past the final checkpoint; `[` must step back onto a
+        // checkpoint line strictly above the current cursor.
+        handle_key(&mut s, key(KeyCode::Char('G')));
+        let after_g = s.cursor();
+
+        handle_key(&mut s, key(KeyCode::Char('[')));
+        assert!(s.cursor() < after_g, "[ should rewind the cursor");
+        assert!(s.checkpoints().iter().any(|c| c.line == s.cursor()));
+
+        let first_back = s.cursor();
+        handle_key(&mut s, key(KeyCode::Char('[')));
+        assert!(s.cursor() < first_back, "[ should rewind again");
+    }
+
+    #[test]
+    fn close_bracket_at_end_flashes_no_more_checkpoints() {
+        let mut s = state_with_two_user_turns_and_a_stop();
+        handle_key(&mut s, key(KeyCode::Char('G'))); // bottom
+        handle_key(&mut s, key(KeyCode::Char(']')));
+        assert_eq!(s.flash(), Some("no more checkpoints"));
+    }
+
+    #[test]
+    fn open_bracket_at_top_flashes_no_previous_checkpoints() {
+        let mut s = state_with_two_user_turns_and_a_stop();
+        assert_eq!(s.cursor(), 0);
+        handle_key(&mut s, key(KeyCode::Char('[')));
+        assert_eq!(s.flash(), Some("no previous checkpoints"));
+    }
+
+    #[test]
+    fn active_checkpoint_index_follows_cursor() {
+        let mut s = state_with_two_user_turns_and_a_stop();
+        // At the top: active checkpoint is the first one (user1).
+        assert_eq!(s.active_checkpoint_index(), Some(0));
+        // After `]`: cursor moves to the second checkpoint.
+        handle_key(&mut s, key(KeyCode::Char(']')));
+        assert_eq!(s.active_checkpoint_index(), Some(1));
     }
 
     #[test]

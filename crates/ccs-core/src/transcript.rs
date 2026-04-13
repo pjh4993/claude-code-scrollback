@@ -32,6 +32,12 @@ pub struct Message {
     pub role: Role,
     pub uuid: String,
     pub timestamp: String,
+    /// If this message represents a Claude Code system event that
+    /// carried a `stopReason` field, the reason is preserved here so
+    /// the viewer can surface it as a typed "stop" checkpoint instead
+    /// of grepping the synthesized text block. `None` on every user
+    /// and assistant message today.
+    pub stop_reason: Option<String>,
     pub blocks: Vec<Block>,
 }
 
@@ -201,6 +207,7 @@ impl Transcript {
                         role: Role::User,
                         uuid: me.uuid,
                         timestamp: me.timestamp,
+                        stop_reason: None,
                         blocks,
                     });
                     next_index += 1;
@@ -219,6 +226,7 @@ impl Transcript {
                         role: Role::Assistant,
                         uuid: me.uuid,
                         timestamp: me.timestamp,
+                        stop_reason: None,
                         blocks,
                     });
                     next_index += 1;
@@ -326,6 +334,7 @@ fn lower_system_event(se: SystemEvent, index: usize) -> Option<Message> {
         role: Role::System,
         uuid: se.uuid,
         timestamp: se.timestamp,
+        stop_reason: se.stop_reason,
         blocks: vec![Block::Text(text)],
     })
 }
@@ -344,6 +353,7 @@ fn lower_attachment_event(
         role: Role::User,
         uuid: ae.uuid,
         timestamp: ae.timestamp,
+        stop_reason: None,
         blocks: vec![Block::Attachment(summary)],
     })
 }

@@ -56,6 +56,34 @@ pub enum CollapseAll {
     ToolsAndThinking,
 }
 
+/// What kind of auto-checkpoint a [`Checkpoint`] marks. Compaction
+/// boundaries are deliberately absent for now; detecting them requires
+/// plumbing from `ccs-core::tail` and is tracked separately (GH #32).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CheckpointKind {
+    /// Start of a user message — the natural "new turn" boundary.
+    UserTurn,
+    /// End of an assistant reply, as reported by Claude Code's
+    /// `stopReason` system event. Carries the reason for the sidebar
+    /// preview (`end_turn`, `max_tokens`, …).
+    Stop(String),
+}
+
+/// One auto-checkpoint, pinned to a specific line in the current layout
+/// pass. Rebuilt alongside the line cache on every relayout so `line`
+/// stays valid after collapse / width changes.
+#[derive(Debug, Clone)]
+pub struct Checkpoint {
+    /// Line index into `TranscriptState::lines` to jump to.
+    pub line: usize,
+    /// Owning message index — stable across relayouts; used by the
+    /// sidebar to highlight the checkpoint nearest the cursor.
+    pub msg_index: usize,
+    pub kind: CheckpointKind,
+    /// Short, role-aware summary shown in the sidebar list.
+    pub preview: String,
+}
+
 /// Viewer state: transcript, cache, viewport, scroll, collapse set, and
 /// vim-chord state. The cache (`lines`) is rebuilt via [`relayout`] any
 /// time the viewport width, collapse set, or `collapse_all` mode changes.
@@ -65,6 +93,11 @@ pub struct TranscriptState {
     /// Cursor line index → one per `user` message. Sorted ascending; used
     /// by `{` and `}` for prev/next-user-turn jumps.
     user_turn_line_starts: Vec<usize>,
+    /// Auto-checkpoints rebuilt on every relayout — entries are sorted by
+    /// `line` and drive both the sidebar list and the `[` / `]` jumps.
+    checkpoints: Vec<Checkpoint>,
+    /// Whether the checkpoint sidebar is visible. Toggled by `c`.
+    show_sidebar: bool,
 
     viewport_width: u16,
     viewport_height: u16,
@@ -130,6 +163,8 @@ impl TranscriptState {
             transcript,
             lines: Vec::new(),
             user_turn_line_starts: Vec::new(),
+            checkpoints: Vec::new(),
+            show_sidebar: false,
             viewport_width: 0,
             viewport_height: 0,
             scroll: 0,
@@ -295,6 +330,7 @@ impl TranscriptState {
         let out = layout::build(&self.transcript, self.viewport_width, &ctx);
         self.lines = out.lines;
         self.user_turn_line_starts = out.user_turn_line_starts;
+        self.checkpoints = out.checkpoints;
         self.dirty = false;
         if self.cursor >= self.lines.len() {
             self.cursor = self.lines.len().saturating_sub(1);
@@ -408,6 +444,56 @@ impl TranscriptState {
                 self.clamp_scroll();
             }
             None => self.set_flash("no previous user turns"),
+        }
+    }
+
+    // --- checkpoints ------------------------------------------------------
+
+    pub fn checkpoints(&self) -> &[Checkpoint] {
+        &self.checkpoints
+    }
+
+    pub fn show_sidebar(&self) -> bool {
+        self.show_sidebar
+    }
+
+    /// Toggle the checkpoint sidebar (`c`). Relayout is not needed —
+    /// the sidebar is rendered from the already-built `checkpoints` vec;
+    /// only the render-time horizontal split changes.
+    pub fn toggle_sidebar(&mut self) {
+        self.show_sidebar = !self.show_sidebar;
+    }
+
+    /// Index of the checkpoint at-or-before the current cursor line, or
+    /// `None` if the cursor sits before the first checkpoint. Used by
+    /// the sidebar to highlight the active row.
+    pub fn active_checkpoint_index(&self) -> Option<usize> {
+        self.checkpoints.iter().rposition(|c| c.line <= self.cursor)
+    }
+
+    /// Jump the cursor to the next checkpoint (`]`). Flashes when there
+    /// are no more checkpoints after the cursor.
+    pub fn jump_next_checkpoint(&mut self) {
+        let next = self.checkpoints.iter().find(|c| c.line > self.cursor);
+        match next {
+            Some(cp) => {
+                self.cursor = cp.line;
+                self.clamp_scroll();
+            }
+            None => self.set_flash("no more checkpoints"),
+        }
+    }
+
+    /// Jump the cursor to the previous checkpoint (`[`). Flashes when
+    /// the cursor is already at or before the first checkpoint.
+    pub fn jump_prev_checkpoint(&mut self) {
+        let prev = self.checkpoints.iter().rev().find(|c| c.line < self.cursor);
+        match prev {
+            Some(cp) => {
+                self.cursor = cp.line;
+                self.clamp_scroll();
+            }
+            None => self.set_flash("no previous checkpoints"),
         }
     }
 
