@@ -476,6 +476,34 @@ mod tests {
     }
 
     #[test]
+    fn same_session_save_merges_with_concurrent_writes() {
+        // Two TranscriptStates opened on the same session file: each
+        // sets a different letter. The second save must preserve the
+        // first's letter rather than overwriting with its stale snapshot.
+        let tmp = tempfile::tempdir().unwrap();
+        let marks_path = tmp.path().join("marks.json");
+
+        let mut s1 = state_with_n_messages(20);
+        s1.attach_marks_file(marks_path.clone());
+        let mut s2 = state_with_n_messages(20);
+        s2.attach_marks_file(marks_path.clone());
+
+        handle_key(&mut s1, key(KeyCode::Char('j')));
+        handle_key(&mut s1, key(KeyCode::Char('m')));
+        handle_key(&mut s1, key(KeyCode::Char('a')));
+
+        handle_key(&mut s2, key(KeyCode::Char('j')));
+        handle_key(&mut s2, key(KeyCode::Char('m')));
+        handle_key(&mut s2, key(KeyCode::Char('b')));
+
+        // Fresh attach — disk should carry both letters.
+        let mut s3 = state_with_n_messages(20);
+        s3.attach_marks_file(marks_path);
+        assert!(s3.marks().contains_key(&'a'));
+        assert!(s3.marks().contains_key(&'b'));
+    }
+
+    #[test]
     fn marks_persist_through_attach_marks_file() {
         // Setting a mark in one TranscriptState and then opening a fresh
         // state pointed at the same marks.json must reproduce the mark.

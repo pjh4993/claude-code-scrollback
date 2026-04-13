@@ -430,15 +430,25 @@ impl TranscriptState {
     /// Persist the current session's marks back to `marks.json`. Uses
     /// [`checkpoints::update_session`] so concurrent viewers cannot
     /// clobber each other's session entries via an interleaved
-    /// read/modify/write. Failures are logged but not surfaced — a
-    /// broken home directory should not break the viewer mid-session.
+    /// read/modify/write.
+    ///
+    /// Merges against `current` rather than overwriting: if the same
+    /// session is open in two viewers, both sides see the union of
+    /// marks — last-write-wins per letter, but letters the other
+    /// viewer set are preserved. Failures are logged but not surfaced;
+    /// a broken home directory should not break the viewer mid-session.
     fn save_marks(&self) {
         let Some(path) = self.marks_path.as_ref() else {
             return;
         };
-        let marks = self.marks.clone();
-        let result =
-            checkpoints::update_session(path, &self.transcript.session_id, |_current| Some(marks));
+        let local = self.marks.clone();
+        let result = checkpoints::update_session(path, &self.transcript.session_id, |current| {
+            let mut merged = current.cloned().unwrap_or_default();
+            for (letter, mark) in local {
+                merged.insert(letter, mark);
+            }
+            Some(merged)
+        });
         if let Err(e) = result {
             tracing::warn!(error = %e, "failed to persist marks.json");
         }
