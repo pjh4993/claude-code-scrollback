@@ -77,19 +77,35 @@ pub fn load_from_path(path: &Path) -> anyhow::Result<Transcript> {
 }
 
 /// Like [`load_from_path`] but also returns the byte offset immediately
-/// past the last byte consumed. Live-tail callers (PJH-51) pair the
-/// returned offset with a [`crate::tail::TailReader::open_at`] to make
-/// the initial snapshot race-free: any bytes written after this function
-/// returns will be picked up by the tail reader's next poll, not
-/// silently re-loaded or dropped.
+/// past the last **newline-terminated** line consumed. Live-tail callers
+/// (PJH-51) pair the returned offset with a
+/// [`crate::tail::TailReader::open_at`] to make the initial snapshot
+/// race-free: any bytes written after this function returns — including
+/// the completion of a line that was still being written when the
+/// snapshot was taken — are picked up by the tail reader's next poll.
+///
+/// **Important:** bytes past the last `\n` are *not* counted toward the
+/// returned offset. If the hydration catches a JSONL mid-write, the
+/// unterminated trailing fragment stays on disk for the tail reader to
+/// reassemble; feeding its offset into `open_at` would otherwise lose
+/// the event when the final `}` arrives.
 pub fn load_from_path_with_offset(path: &Path) -> anyhow::Result<(Transcript, u64)> {
     use std::io::Read;
     let mut file = File::open(path)?;
     let mut raw = String::new();
-    let bytes_read = file.read_to_string(&mut raw)? as u64;
+    file.read_to_string(&mut raw)?;
+
+    // Only count bytes up to the last newline as "consumed"; any
+    // trailing fragment belongs to the tail reader, not to us.
+    let complete_bytes = match raw.rfind('\n') {
+        Some(pos) => pos + 1,
+        None => 0,
+    };
+    let complete_src = &raw[..complete_bytes];
+
     let mut events: Vec<Event> = Vec::new();
     let mut saw_non_empty = false;
-    for (idx, line) in raw.lines().enumerate() {
+    for (idx, line) in complete_src.lines().enumerate() {
         if line.trim().is_empty() {
             continue;
         }
@@ -109,7 +125,7 @@ pub fn load_from_path_with_offset(path: &Path) -> anyhow::Result<(Transcript, u6
     if saw_non_empty && events.is_empty() {
         anyhow::bail!("no valid JSONL events recovered from {}", path.display());
     }
-    Ok((from_events(events), bytes_read))
+    Ok((from_events(events), complete_bytes as u64))
 }
 
 /// Build a [`Transcript`] from a stream of parsed events.
@@ -652,6 +668,45 @@ mod tests {
         ]));
         assert_eq!(t.messages.len(), 1);
         assert_eq!(t.messages[0].uuid, "u2");
+    }
+
+    #[test]
+    fn load_from_path_with_offset_stops_at_last_newline() {
+        // Regression for PJH-51 review finding: when the file ends with
+        // an unterminated trailing fragment (Claude Code still writing),
+        // load_from_path_with_offset must return an offset that excludes
+        // that fragment so the tail reader can reassemble the event once
+        // the final `\n` arrives. Otherwise TailReader::open_at seeks
+        // past the incomplete line and silently loses the event.
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("midwrite.jsonl");
+        let mut f = File::create(&path).unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"user","uuid":"u1","sessionId":"s1","timestamp":"t","message":{{"role":"user","content":"complete"}}}}"#
+        )
+        .unwrap();
+        // Trailing fragment — no newline. 50 bytes of a half-written event.
+        write!(f, r#"{{"type":"assistant","uuid":"a1","ses"#).unwrap();
+        drop(f);
+
+        let (t, offset) = load_from_path_with_offset(&path).unwrap();
+        // The complete line parses; the fragment is not counted.
+        assert_eq!(t.messages.len(), 1);
+        assert_eq!(t.messages[0].role, Role::User);
+        // Offset should land exactly at the end of the first line,
+        // leaving the fragment on disk for the tail reader.
+        let total_len = std::fs::metadata(&path).unwrap().len();
+        assert!(
+            offset < total_len,
+            "offset {offset} must be less than total_len {total_len}"
+        );
+        // And it should equal the length of the first newline-terminated
+        // line (the one the parser consumed).
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let first_newline = raw.find('\n').unwrap() + 1;
+        assert_eq!(offset as usize, first_newline);
     }
 
     #[test]

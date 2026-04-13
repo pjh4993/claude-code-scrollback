@@ -185,6 +185,15 @@ fn build_status(state: &TranscriptState) -> Line<'static> {
     spans.push(Span::raw(format!(
         "session {session_short}  ·  project {project}  ·  msg {current_msg}/{total_msgs}  ·  line {current_line}/{total_lines}  ·  q/Esc quit"
     )));
+    // When live-tail is paused, the default footer doesn't tell the
+    // user how to resume following. Surface the keys explicitly so the
+    // paused state is self-discoverable.
+    if state.is_live() && !state.is_following() {
+        spans.push(Span::styled(
+            "  (F/G to follow)".to_string(),
+            Style::new().fg(Color::Yellow).add_modifier(Modifier::DIM),
+        ));
+    }
     Line::from(spans)
 }
 

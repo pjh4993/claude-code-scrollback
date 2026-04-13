@@ -43,9 +43,15 @@ fn main() -> Result<()> {
         (true, explicit) => {
             // `--live` with an explicit session id/path opens that one
             // and follows it; `--live` alone auto-detects the active
-            // session under the current cwd's project.
+            // session under the current cwd's project. An explicit
+            // target that resolves to nothing is a hard error — live
+            // mode has no useful empty state and a silent fall-through
+            // to an empty viewer would bury the typo.
             let session = match explicit {
-                Some(target) => resolve_session_target(&target)?,
+                Some(target) => match resolve_session_target(&target)? {
+                    Some(s) => Some(s),
+                    None => anyhow::bail!("unknown session id or path: {target}"),
+                },
                 None => resolve_active_session()?,
             };
             Screen::viewer(true, session)

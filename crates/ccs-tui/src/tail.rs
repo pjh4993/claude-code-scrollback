@@ -22,11 +22,15 @@ pub struct Update {
     /// True if the underlying file was rewritten (compaction); the
     /// caller must reset its transcript before feeding `new_events`.
     pub reset: bool,
+    /// Number of malformed JSONL lines skipped during this tick. Also
+    /// logged at `warn`, but exposed here so the viewer can surface a
+    /// one-line flash when schema drift starts dropping events.
+    pub errors_skipped: usize,
 }
 
 impl Update {
     pub fn is_empty(&self) -> bool {
-        self.new_events.is_empty() && !self.reset
+        self.new_events.is_empty() && !self.reset && self.errors_skipped == 0
     }
 }
 
@@ -57,10 +61,12 @@ impl LiveTail {
     }
 
     /// Read whatever is new in the file and return parsed events.
-    /// Malformed lines are logged but not surfaced — the viewer should
-    /// keep running through schema drift.
+    /// Malformed lines are logged and counted in `errors_skipped` but
+    /// don't abort the stream — the viewer should keep running through
+    /// schema drift.
     pub fn poll(&mut self) -> anyhow::Result<Update> {
         let poll = self.reader.poll()?;
+        let errors_skipped = poll.errors.len();
         for (line, err) in &poll.errors {
             tracing::warn!(
                 path = %self.reader.path().display(),
@@ -72,6 +78,7 @@ impl LiveTail {
         Ok(Update {
             new_events: poll.events.into_iter().map(|te| te.event).collect(),
             reset: poll.reset,
+            errors_skipped,
         })
     }
 }

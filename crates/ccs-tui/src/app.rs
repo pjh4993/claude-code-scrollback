@@ -144,10 +144,22 @@ impl App {
         match tail.poll() {
             Ok(update) if update.is_empty() => {}
             Ok(update) => {
+                if update.errors_skipped > 0 {
+                    state.set_flash(format!(
+                        "live-tail skipped {} malformed line(s)",
+                        update.errors_skipped
+                    ));
+                }
                 if update.reset {
                     // File was rewritten under us. Reload from disk
                     // and replace the transcript wholesale; the live
-                    // tail reader already seeked back to 0.
+                    // tail reader already seeked back to 0. If the
+                    // reload fails we must NOT keep the old
+                    // transcript — the tail reader will start
+                    // streaming the new file on top of stale messages
+                    // and mix two timelines. Fall back to an empty
+                    // transcript so subsequent polls produce a clean
+                    // rebuild.
                     if let Some(session) = v.session.as_ref() {
                         match transcript::load_from_path(&session.path) {
                             Ok(fresh) => state.reset_transcript(fresh),
@@ -155,8 +167,10 @@ impl App {
                                 tracing::error!(
                                     path = %session.path.display(),
                                     error = %err,
-                                    "reload after tail reset failed",
+                                    "reload after tail reset failed — clearing transcript",
                                 );
+                                state.reset_transcript(ccs_core::transcript::Transcript::default());
+                                state.set_flash("session compacted; reload failed");
                             }
                         }
                     }

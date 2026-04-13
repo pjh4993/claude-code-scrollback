@@ -348,6 +348,7 @@ impl TranscriptState {
 
     /// Jump the cursor to the next user-turn line (`}`).
     pub fn jump_next_user_turn(&mut self) {
+        self.disable_follow_on_manual_scroll();
         let next = self
             .user_turn_line_starts
             .iter()
@@ -364,6 +365,7 @@ impl TranscriptState {
 
     /// Jump the cursor to the previous user-turn line (`{`).
     pub fn jump_prev_user_turn(&mut self) {
+        self.disable_follow_on_manual_scroll();
         let prev = self
             .user_turn_line_starts
             .iter()
