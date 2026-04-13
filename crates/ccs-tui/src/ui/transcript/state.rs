@@ -105,6 +105,13 @@ pub struct TranscriptState {
     /// follow-mode; `G` and `F` re-engage it.
     follow: bool,
 
+    /// Latched request to snap to the bottom on the first non-empty
+    /// relayout. `new_live` sets this because `hydrate` runs before
+    /// the first viewport is known: at construction time `lines` is
+    /// empty and `jump_bottom` would no-op. The flag is consumed the
+    /// first time `relayout` produces a non-empty cache.
+    needs_initial_bottom: bool,
+
     /// In-viewer search UI mode. Owns the query buffer, committed
     /// matches, and the current match cursor.
     search: SearchMode,
@@ -136,6 +143,7 @@ impl TranscriptState {
             marks_path: None,
             live: false,
             follow: false,
+            needs_initial_bottom: false,
             search: SearchMode::new(),
             flash: None,
             dirty: true,
@@ -144,11 +152,16 @@ impl TranscriptState {
 
     /// Construct a state for a live-tail viewer: the same as [`new`]
     /// but `live` and `follow` default to `true` so new events pin the
-    /// cursor to the bottom until the user scrolls up manually.
+    /// cursor to the bottom until the user scrolls up manually. Also
+    /// latches `needs_initial_bottom` so the first non-empty relayout
+    /// pins the cursor to the tail — which is what a live-tail user
+    /// actually wants to see on open, rather than the top of the
+    /// backlog.
     pub fn new_live(transcript: Transcript) -> Self {
         let mut s = Self::new(transcript);
         s.live = true;
         s.follow = true;
+        s.needs_initial_bottom = true;
         s
     }
 
@@ -195,8 +208,16 @@ impl TranscriptState {
     /// rewrite (compaction) where the on-disk line order has changed.
     /// Cursor / scroll state is preserved when possible but follow
     /// mode snaps to the bottom to keep the user at the new head.
+    ///
+    /// Clears the collapse set and marks because `BlockId` and
+    /// `Mark` are positional (`msg_index`, `block_index`): after
+    /// compaction those coordinates refer to different blocks (or
+    /// none), so keeping the old entries would quietly decorate
+    /// random unrelated blocks and land jumps on the wrong turn.
     pub fn reset_transcript(&mut self, transcript: Transcript) {
         self.transcript = transcript;
+        self.collapsed.clear();
+        self.marks.clear();
         self.dirty = true;
         self.relayout();
         if self.follow {
@@ -277,6 +298,15 @@ impl TranscriptState {
         self.dirty = false;
         if self.cursor >= self.lines.len() {
             self.cursor = self.lines.len().saturating_sub(1);
+        }
+        // Consume the latched "jump to bottom on first real layout"
+        // flag set by `new_live`. Without this, a live-tail viewer
+        // opened against an existing backlog would display the top
+        // of the backlog until a new tail event arrived, because
+        // `new_live` runs before the first viewport is known.
+        if self.needs_initial_bottom && !self.lines.is_empty() {
+            self.cursor = self.lines.len() - 1;
+            self.needs_initial_bottom = false;
         }
         self.clamp_scroll();
     }
@@ -692,6 +722,65 @@ mod tests {
         s.set_viewport(80, 20);
         assert!(s.is_live());
         assert!(s.is_following());
+    }
+
+    #[test]
+    fn new_live_with_existing_backlog_lands_cursor_at_bottom() {
+        // Regression: hydrate() no longer calls jump_bottom() because
+        // lines is empty at construction time; the first relayout has
+        // to consume the `needs_initial_bottom` flag instead.
+        let lines: Vec<String> = (0..10)
+            .map(|i| {
+                format!(
+                    r#"{{"type":"user","uuid":"u{i}","sessionId":"s1","timestamp":"t","message":{{"role":"user","content":"msg-{i}"}}}}"#
+                )
+            })
+            .collect();
+        let t: Transcript = from_events(lines.iter().map(|l| parse_line(l).unwrap()));
+        let mut s = TranscriptState::new_live(t);
+        s.set_viewport(80, 20);
+        assert!(
+            !s.lines().is_empty(),
+            "layout should have produced lines by now"
+        );
+        assert_eq!(
+            s.cursor(),
+            s.lines().len() - 1,
+            "live viewer with existing backlog must open at the tail, not the top"
+        );
+    }
+
+    #[test]
+    fn reset_transcript_clears_collapsed_and_marks() {
+        // Regression: BlockId and Mark are positional, so compaction
+        // makes old coordinates meaningless. reset_transcript must
+        // wipe them rather than decorate random new blocks.
+        let t = t_with(&[
+            r#"{"type":"assistant","uuid":"a1","sessionId":"s1","timestamp":"t","message":{"role":"assistant","content":[{"type":"thinking","thinking":"hm"}]}}"#,
+        ]);
+        let mut s = TranscriptState::new_live(t);
+        s.set_viewport(80, 20);
+        // Land cursor on the thinking body, collapse it, and plant a mark.
+        for _ in 0..20 {
+            if let Some(rl) = s.lines().get(s.cursor()) {
+                if rl.block_index == Some(0) && rl.kind == LineKind::Body {
+                    break;
+                }
+            }
+            s.move_down(1);
+        }
+        s.toggle_current_block();
+        assert!(!s.collapsed().is_empty());
+        s.set_mark('a');
+        assert!(s.marks().contains_key(&'a'));
+
+        // Fresh transcript after compaction.
+        let fresh = t_with(&[
+            r#"{"type":"user","uuid":"u1","sessionId":"s1","timestamp":"t","message":{"role":"user","content":"new"}}"#,
+        ]);
+        s.reset_transcript(fresh);
+        assert!(s.collapsed().is_empty());
+        assert!(s.marks().is_empty());
     }
 
     #[test]

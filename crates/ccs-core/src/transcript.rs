@@ -72,8 +72,41 @@ pub enum Block {
 /// non-empty line fails to parse, this returns an error so the viewer
 /// can surface "this file is not a Claude Code session" instead of
 /// silently rendering an empty transcript.
+///
+/// Unlike [`load_from_path_with_offset`], which intentionally leaves an
+/// unterminated trailing fragment on disk for the tail reader to pick
+/// up, this function is used by the *static* viewer where nothing will
+/// come along and reassemble the line — so it falls back to parsing
+/// the trailing bytes directly and appending them on success. A
+/// fragment that fails to parse is silently dropped (same as any
+/// malformed complete line).
 pub fn load_from_path(path: &Path) -> anyhow::Result<Transcript> {
-    Ok(load_from_path_with_offset(path)?.0)
+    use std::io::{Read, Seek, SeekFrom};
+    let (mut transcript, offset) = load_from_path_with_offset(path)?;
+    let mut file = File::open(path)?;
+    let file_len = file.metadata()?.len();
+    if offset >= file_len {
+        return Ok(transcript);
+    }
+    file.seek(SeekFrom::Start(offset))?;
+    let mut tail = String::new();
+    file.read_to_string(&mut tail)?;
+    let trimmed = tail.trim();
+    if trimmed.is_empty() {
+        return Ok(transcript);
+    }
+    match jsonl::parse_line(trimmed) {
+        Ok(ev) => transcript.append_events(std::iter::once(ev)),
+        Err(err) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %err,
+                bytes = trimmed.len(),
+                "dropping unterminated trailing fragment from static load",
+            );
+        }
+    }
+    Ok(transcript)
 }
 
 /// Like [`load_from_path`] but also returns the byte offset immediately
@@ -668,6 +701,35 @@ mod tests {
         ]));
         assert_eq!(t.messages.len(), 1);
         assert_eq!(t.messages[0].uuid, "u2");
+    }
+
+    #[test]
+    fn load_from_path_parses_unterminated_trailing_line() {
+        // Regression: load_from_path_with_offset intentionally skips
+        // the trailing fragment so the tail reader can reassemble it,
+        // but the static load path (no tail) has to read it or the
+        // final message is silently dropped.
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("midwrite.jsonl");
+        let mut f = File::create(&path).unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"user","uuid":"u1","sessionId":"s1","timestamp":"t","message":{{"role":"user","content":"first"}}}}"#
+        )
+        .unwrap();
+        // Second line — complete JSON but no trailing newline.
+        write!(
+            f,
+            r#"{{"type":"assistant","uuid":"a1","sessionId":"s1","timestamp":"t","message":{{"role":"assistant","content":[{{"type":"text","text":"second"}}]}}}}"#
+        )
+        .unwrap();
+        drop(f);
+
+        let t = load_from_path(&path).unwrap();
+        assert_eq!(t.messages.len(), 2);
+        assert_eq!(t.messages[0].role, Role::User);
+        assert_eq!(t.messages[1].role, Role::Assistant);
     }
 
     #[test]

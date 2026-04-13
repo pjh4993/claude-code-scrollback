@@ -79,9 +79,12 @@ impl Screen {
                         }
                         if v.live {
                             v.tail = Some(LiveTail::new_at(session.path.clone(), offset));
-                            // Start the cursor at the bottom so the
-                            // user sees the tail, not the top.
-                            state.jump_bottom();
+                            // Cursor-to-tail happens inside the first
+                            // `relayout` via `needs_initial_bottom`,
+                            // latched by `TranscriptState::new_live`.
+                            // Calling `jump_bottom` here would no-op
+                            // because `lines` is still empty until
+                            // the first viewport is known.
                         }
                         v.state = Some(state);
                     }

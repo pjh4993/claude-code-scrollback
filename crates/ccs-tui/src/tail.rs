@@ -64,6 +64,12 @@ impl LiveTail {
     /// Malformed lines are logged and counted in `errors_skipped` but
     /// don't abort the stream — the viewer should keep running through
     /// schema drift.
+    ///
+    /// Important: the warn log deliberately does **not** include the
+    /// failing line's content. Session JSONL carries user prompts and
+    /// model output, and echoing arbitrary bytes into `tracing::warn`
+    /// would leak them into whatever log sink the process is wired to.
+    /// Only the byte count and the parser error message are emitted.
     pub fn poll(&mut self) -> anyhow::Result<Update> {
         let poll = self.reader.poll()?;
         let errors_skipped = poll.errors.len();
@@ -71,7 +77,7 @@ impl LiveTail {
             tracing::warn!(
                 path = %self.reader.path().display(),
                 error = %err,
-                line_preview = %&line.chars().take(80).collect::<String>(),
+                bytes = line.len(),
                 "skipping malformed JSONL line in live tail",
             );
         }
