@@ -472,8 +472,10 @@ impl TranscriptState {
     }
 
     /// Jump the cursor to the next checkpoint (`]`). Flashes when there
-    /// are no more checkpoints after the cursor.
+    /// are no more checkpoints after the cursor. Pauses live-tail
+    /// follow so a subsequent append doesn't yank the user back to EOF.
     pub fn jump_next_checkpoint(&mut self) {
+        self.disable_follow_on_manual_scroll();
         let next = self.checkpoints.iter().find(|c| c.line > self.cursor);
         match next {
             Some(cp) => {
@@ -485,8 +487,10 @@ impl TranscriptState {
     }
 
     /// Jump the cursor to the previous checkpoint (`[`). Flashes when
-    /// the cursor is already at or before the first checkpoint.
+    /// the cursor is already at or before the first checkpoint. Pauses
+    /// live-tail follow for the same reason as [`jump_next_checkpoint`].
     pub fn jump_prev_checkpoint(&mut self) {
+        self.disable_follow_on_manual_scroll();
         let prev = self.checkpoints.iter().rev().find(|c| c.line < self.cursor);
         match prev {
             Some(cp) => {
@@ -909,6 +913,40 @@ mod tests {
             r#"{"type":"user","uuid":"u4","sessionId":"s1","timestamp":"t","message":{"role":"user","content":"four"}}"#,
         )]);
         assert_eq!(s.cursor(), paused_cursor);
+    }
+
+    #[test]
+    fn checkpoint_jumps_pause_live_follow() {
+        // `[` and `]` must stop live-tail from yanking the cursor back
+        // to EOF on the next append, same as `j/k`, `gg`, and `{ }`.
+        let t = t_with(&[
+            r#"{"type":"user","uuid":"u1","sessionId":"s1","timestamp":"t","message":{"role":"user","content":"one"}}"#,
+            r#"{"type":"user","uuid":"u2","sessionId":"s1","timestamp":"t","message":{"role":"user","content":"two"}}"#,
+            r#"{"type":"user","uuid":"u3","sessionId":"s1","timestamp":"t","message":{"role":"user","content":"three"}}"#,
+        ]);
+        let mut s = TranscriptState::new_live(t);
+        s.set_viewport(80, 20);
+        s.jump_bottom();
+        assert!(s.is_following());
+
+        // Step back via `[` → follow disengages and cursor stays put
+        // when a new event arrives.
+        s.jump_prev_checkpoint();
+        assert!(!s.is_following());
+        let paused_cursor = s.cursor();
+        s.append_events(vec![event(
+            r#"{"type":"user","uuid":"u4","sessionId":"s1","timestamp":"t","message":{"role":"user","content":"four"}}"#,
+        )]);
+        assert_eq!(s.cursor(), paused_cursor);
+
+        // Re-engage follow with `G`, then step forward via `]` — follow
+        // must disengage again.
+        s.jump_bottom();
+        assert!(s.is_following());
+        s.jump_next_checkpoint();
+        // There may be no more checkpoints (we're at EOF), but the jump
+        // path still runs `disable_follow_on_manual_scroll` first.
+        assert!(!s.is_following());
     }
 
     #[test]

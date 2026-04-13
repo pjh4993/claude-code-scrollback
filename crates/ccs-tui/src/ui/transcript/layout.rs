@@ -67,12 +67,14 @@ pub fn build(transcript: &Transcript, width: u16, ctx: &CollapseContext<'_>) -> 
         if let Some(reason) = msg.stop_reason.as_ref() {
             // System messages carrying a stopReason become Stop checkpoints
             // at their own header line — that's where the user sees the
-            // `stop_reason=…` text today.
+            // `stop_reason=…` text today. `preview` holds only the raw
+            // reason; the sidebar render adds the "stop" label up front
+            // so we don't end up rendering "stop  stop: end_turn".
             checkpoints.push(Checkpoint {
                 line: header_idx,
                 msg_index: msg.index,
                 kind: CheckpointKind::Stop(reason.clone()),
-                preview: format!("stop: {reason}"),
+                preview: reason.clone(),
             });
         }
         for (block_idx, block) in msg.blocks.iter().enumerate() {
@@ -619,7 +621,9 @@ mod tests {
             .collect();
         assert_eq!(stops.len(), 1);
         assert_eq!(stops[0].1, "end_turn");
-        assert_eq!(stops[0].2, "stop: end_turn");
+        // Preview is just the raw reason; the sidebar render adds the
+        // "stop" label so we don't double-prefix the row.
+        assert_eq!(stops[0].2, "end_turn");
         assert_eq!(out.lines[stops[0].0].kind, LineKind::Header);
     }
 
