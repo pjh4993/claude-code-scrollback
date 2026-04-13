@@ -400,6 +400,10 @@ impl TranscriptState {
     /// since been collapsed, we fall back to the first line whose
     /// `msg_index` matches, so the jump always lands somewhere reasonable.
     pub fn jump_to_mark(&mut self, letter: char) {
+        if !letter.is_ascii_lowercase() {
+            self.set_flash(format!("bad mark '{letter}'"));
+            return;
+        }
         let Some(&mark) = self.marks.get(&letter) else {
             self.set_flash(format!("no mark {letter}"));
             return;
@@ -423,21 +427,19 @@ impl TranscriptState {
         }
     }
 
-    /// Persist the current session's marks back to `marks.json`. Failures
-    /// are logged but not surfaced — a broken home directory should not
-    /// break the viewer mid-session.
+    /// Persist the current session's marks back to `marks.json`. Uses
+    /// [`checkpoints::update_session`] so concurrent viewers cannot
+    /// clobber each other's session entries via an interleaved
+    /// read/modify/write. Failures are logged but not surfaced — a
+    /// broken home directory should not break the viewer mid-session.
     fn save_marks(&self) {
         let Some(path) = self.marks_path.as_ref() else {
             return;
         };
-        let mut file = checkpoints::load(path);
-        if self.marks.is_empty() {
-            file.sessions.remove(&self.transcript.session_id);
-        } else {
-            file.sessions
-                .insert(self.transcript.session_id.clone(), self.marks.clone());
-        }
-        if let Err(e) = checkpoints::save(path, &file) {
+        let marks = self.marks.clone();
+        let result =
+            checkpoints::update_session(path, &self.transcript.session_id, |_current| Some(marks));
+        if let Err(e) = result {
             tracing::warn!(error = %e, "failed to persist marks.json");
         }
     }

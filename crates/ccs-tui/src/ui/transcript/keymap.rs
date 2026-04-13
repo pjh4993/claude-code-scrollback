@@ -462,6 +462,20 @@ mod tests {
     }
 
     #[test]
+    fn quote_with_invalid_letter_is_rejected() {
+        // `'A` and `'1` must flash "bad mark" (same rule as `mA`), not
+        // "no mark" — otherwise set and jump disagree on what's valid.
+        let mut s = state_with_n_messages(10);
+        handle_key(&mut s, key(KeyCode::Char('\'')));
+        handle_key(&mut s, key(KeyCode::Char('A')));
+        assert_eq!(s.flash(), Some("bad mark 'A'"));
+
+        handle_key(&mut s, key(KeyCode::Char('\'')));
+        handle_key(&mut s, key(KeyCode::Char('1')));
+        assert_eq!(s.flash(), Some("bad mark '1'"));
+    }
+
+    #[test]
     fn marks_persist_through_attach_marks_file() {
         // Setting a mark in one TranscriptState and then opening a fresh
         // state pointed at the same marks.json must reproduce the mark.

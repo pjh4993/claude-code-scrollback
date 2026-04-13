@@ -10,6 +10,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
 /// A saved position inside a transcript.
@@ -90,6 +91,56 @@ pub fn save(path: &Path, file: &MarksFile) -> io::Result<()> {
     Ok(())
 }
 
+/// Atomically update one session's marks in `path` under an exclusive
+/// advisory lock. Callers provide an `update` closure that mutates the
+/// slot for `session_id`; the function takes care of load, merge, save,
+/// and lock release. Without the lock, two concurrent viewers could
+/// both load the same snapshot, each apply their own session's update,
+/// and the later writer would drop the earlier writer's session entry.
+///
+/// A sibling `.lock` file is used as the lock target so the lock
+/// release cannot race against the `tmp → real` rename that [`save`]
+/// performs: the lock file has a stable identity across rewrites.
+///
+/// Setting `marks` to `None` removes that session's entry — used when
+/// every mark has been cleared.
+pub fn update_session<F>(path: &Path, session_id: &str, update: F) -> io::Result<()>
+where
+    F: FnOnce(Option<&SessionMarks>) -> Option<SessionMarks>,
+{
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let lock_path = path.with_extension("json.lock");
+    let lock_file = fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)?;
+    lock_file.lock_exclusive()?;
+
+    let mut file = load(path);
+    let next = update(file.sessions.get(session_id));
+    match next {
+        Some(marks) if marks.is_empty() => {
+            file.sessions.remove(session_id);
+        }
+        Some(marks) => {
+            file.sessions.insert(session_id.to_string(), marks);
+        }
+        None => {
+            file.sessions.remove(session_id);
+        }
+    }
+    let result = save(path, &file);
+
+    // `unlock` is best-effort; the lock also drops when the file handle
+    // is closed on scope exit, so an error here is non-fatal.
+    let _ = FileExt::unlock(&lock_file);
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -153,6 +204,120 @@ mod tests {
                 block_index: None,
             }),
         );
+    }
+
+    #[test]
+    fn update_session_preserves_other_sessions() {
+        // Two sessions' updates must not clobber each other even when
+        // callers only touch their own slot — the locked merge step in
+        // update_session is what makes that safe.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("marks.json");
+
+        update_session(&path, "sess-a", |_| {
+            let mut m = SessionMarks::new();
+            m.insert(
+                'a',
+                Mark {
+                    msg_index: 1,
+                    block_index: None,
+                },
+            );
+            Some(m)
+        })
+        .unwrap();
+        update_session(&path, "sess-b", |_| {
+            let mut m = SessionMarks::new();
+            m.insert(
+                'b',
+                Mark {
+                    msg_index: 2,
+                    block_index: None,
+                },
+            );
+            Some(m)
+        })
+        .unwrap();
+
+        let loaded = load(&path);
+        assert!(loaded.sessions.get("sess-a").unwrap().contains_key(&'a'));
+        assert!(loaded.sessions.get("sess-b").unwrap().contains_key(&'b'));
+    }
+
+    #[test]
+    fn update_session_empty_marks_removes_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("marks.json");
+        update_session(&path, "sess", |_| {
+            let mut m = SessionMarks::new();
+            m.insert(
+                'a',
+                Mark {
+                    msg_index: 0,
+                    block_index: None,
+                },
+            );
+            Some(m)
+        })
+        .unwrap();
+        assert!(load(&path).sessions.contains_key("sess"));
+
+        update_session(&path, "sess", |_| Some(SessionMarks::new())).unwrap();
+        assert!(!load(&path).sessions.contains_key("sess"));
+    }
+
+    #[test]
+    fn update_session_concurrent_writers_do_not_clobber() {
+        // Two threads hammering update_session on disjoint session ids
+        // must each end up with their mark preserved. Without the
+        // advisory lock, a read/modify/write race drops one of them.
+        use std::sync::Arc;
+        use std::thread;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = Arc::new(tmp.path().join("marks.json"));
+
+        let mut handles = Vec::new();
+        for i in 0..8 {
+            let path = Arc::clone(&path);
+            handles.push(thread::spawn(move || {
+                let sess = format!("sess-{i}");
+                for j in 0..5 {
+                    update_session(&path, &sess, |_| {
+                        let mut m = SessionMarks::new();
+                        m.insert(
+                            (b'a' + j as u8) as char,
+                            Mark {
+                                msg_index: j,
+                                block_index: None,
+                            },
+                        );
+                        Some(m)
+                    })
+                    .unwrap();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let loaded = load(&path);
+        for i in 0..8 {
+            let sess = format!("sess-{i}");
+            let marks = loaded
+                .sessions
+                .get(&sess)
+                .unwrap_or_else(|| panic!("{sess} dropped by concurrent writer"));
+            // Each writer ends on letter `e` at msg_index 4.
+            assert_eq!(
+                marks.get(&'e'),
+                Some(&Mark {
+                    msg_index: 4,
+                    block_index: None,
+                }),
+            );
+        }
     }
 
     #[test]
