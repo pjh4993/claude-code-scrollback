@@ -9,7 +9,6 @@
 //! The UI (`ccs-tui`) consumes this module; the CLI's `ccs print` will too.
 
 use std::fs::File;
-use std::io::{BufRead, BufReader};
 use std::path::Path;
 
 use serde_json::Value;
@@ -73,18 +72,78 @@ pub enum Block {
 /// non-empty line fails to parse, this returns an error so the viewer
 /// can surface "this file is not a Claude Code session" instead of
 /// silently rendering an empty transcript.
+///
+/// Unlike [`load_from_path_with_offset`], which intentionally leaves an
+/// unterminated trailing fragment on disk for the tail reader to pick
+/// up, this function is used by the *static* viewer where nothing will
+/// come along and reassemble the line — so it falls back to parsing
+/// the trailing bytes directly and appending them on success. A
+/// fragment that fails to parse is silently dropped (same as any
+/// malformed complete line).
 pub fn load_from_path(path: &Path) -> anyhow::Result<Transcript> {
-    let file = File::open(path)?;
-    let reader = BufReader::new(file);
+    use std::io::{Read, Seek, SeekFrom};
+    let (mut transcript, offset) = load_from_path_with_offset(path)?;
+    let mut file = File::open(path)?;
+    let file_len = file.metadata()?.len();
+    if offset >= file_len {
+        return Ok(transcript);
+    }
+    file.seek(SeekFrom::Start(offset))?;
+    let mut tail = String::new();
+    file.read_to_string(&mut tail)?;
+    let trimmed = tail.trim();
+    if trimmed.is_empty() {
+        return Ok(transcript);
+    }
+    match jsonl::parse_line(trimmed) {
+        Ok(ev) => transcript.append_events(std::iter::once(ev)),
+        Err(err) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %err,
+                bytes = trimmed.len(),
+                "dropping unterminated trailing fragment from static load",
+            );
+        }
+    }
+    Ok(transcript)
+}
+
+/// Like [`load_from_path`] but also returns the byte offset immediately
+/// past the last **newline-terminated** line consumed. Live-tail callers
+/// (PJH-51) pair the returned offset with a
+/// [`crate::tail::TailReader::open_at`] to make the initial snapshot
+/// race-free: any bytes written after this function returns — including
+/// the completion of a line that was still being written when the
+/// snapshot was taken — are picked up by the tail reader's next poll.
+///
+/// **Important:** bytes past the last `\n` are *not* counted toward the
+/// returned offset. If the hydration catches a JSONL mid-write, the
+/// unterminated trailing fragment stays on disk for the tail reader to
+/// reassemble; feeding its offset into `open_at` would otherwise lose
+/// the event when the final `}` arrives.
+pub fn load_from_path_with_offset(path: &Path) -> anyhow::Result<(Transcript, u64)> {
+    use std::io::Read;
+    let mut file = File::open(path)?;
+    let mut raw = String::new();
+    file.read_to_string(&mut raw)?;
+
+    // Only count bytes up to the last newline as "consumed"; any
+    // trailing fragment belongs to the tail reader, not to us.
+    let complete_bytes = match raw.rfind('\n') {
+        Some(pos) => pos + 1,
+        None => 0,
+    };
+    let complete_src = &raw[..complete_bytes];
+
     let mut events: Vec<Event> = Vec::new();
     let mut saw_non_empty = false;
-    for (idx, line) in reader.lines().enumerate() {
-        let line = line?;
+    for (idx, line) in complete_src.lines().enumerate() {
         if line.trim().is_empty() {
             continue;
         }
         saw_non_empty = true;
-        match jsonl::parse_line(&line) {
+        match jsonl::parse_line(line) {
             Ok(ev) => events.push(ev),
             Err(err) => {
                 tracing::warn!(
@@ -99,7 +158,7 @@ pub fn load_from_path(path: &Path) -> anyhow::Result<Transcript> {
     if saw_non_empty && events.is_empty() {
         anyhow::bail!("no valid JSONL events recovered from {}", path.display());
     }
-    Ok(from_events(events))
+    Ok((from_events(events), complete_bytes as u64))
 }
 
 /// Build a [`Transcript`] from a stream of parsed events.
@@ -112,75 +171,87 @@ pub fn load_from_path(path: &Path) -> anyhow::Result<Transcript> {
 ///   carries them.
 pub fn from_events(events: impl IntoIterator<Item = Event>) -> Transcript {
     let mut out = Transcript::default();
-    let mut next_index = 0usize;
+    out.append_events(events);
+    out
+}
 
-    for ev in events {
-        match ev {
-            Event::User(me) => {
-                capture_meta(&mut out, &me);
-                if me.is_sidechain {
-                    continue;
-                }
-                let blocks = lower_message_content(me.message.content);
-                if blocks.is_empty() {
-                    continue;
-                }
-                out.messages.push(Message {
-                    index: next_index,
-                    role: Role::User,
-                    uuid: me.uuid,
-                    timestamp: me.timestamp,
-                    blocks,
-                });
-                next_index += 1;
-            }
-            Event::Assistant(me) => {
-                capture_meta(&mut out, &me);
-                if me.is_sidechain {
-                    continue;
-                }
-                let blocks = lower_message_content(me.message.content);
-                if blocks.is_empty() {
-                    continue;
-                }
-                out.messages.push(Message {
-                    index: next_index,
-                    role: Role::Assistant,
-                    uuid: me.uuid,
-                    timestamp: me.timestamp,
-                    blocks,
-                });
-                next_index += 1;
-            }
-            Event::System(se) => {
-                if out.session_id.is_empty() {
-                    out.session_id = se.session_id.clone();
-                }
-                if let Some(msg) = lower_system_event(se, next_index) {
-                    out.messages.push(msg);
+impl Transcript {
+    /// Extend an existing transcript with a stream of new events. Used by
+    /// live-tail (PJH-51) to incorporate lines appended to the JSONL file
+    /// since the last poll without throwing away the existing lowering.
+    ///
+    /// Indices continue from wherever the last extant message left off,
+    /// so callers that cache line-cache offsets keyed on message index
+    /// stay consistent across appends.
+    pub fn append_events(&mut self, events: impl IntoIterator<Item = Event>) {
+        let mut next_index = self.messages.last().map(|m| m.index + 1).unwrap_or(0);
+        for ev in events {
+            match ev {
+                Event::User(me) => {
+                    capture_meta(self, &me);
+                    if me.is_sidechain {
+                        continue;
+                    }
+                    let blocks = lower_message_content(me.message.content);
+                    if blocks.is_empty() {
+                        continue;
+                    }
+                    self.messages.push(Message {
+                        index: next_index,
+                        role: Role::User,
+                        uuid: me.uuid,
+                        timestamp: me.timestamp,
+                        blocks,
+                    });
                     next_index += 1;
                 }
-            }
-            Event::Attachment(ae) => {
-                if let Some(msg) = lower_attachment_event(ae, next_index, &mut out.session_id) {
-                    out.messages.push(msg);
+                Event::Assistant(me) => {
+                    capture_meta(self, &me);
+                    if me.is_sidechain {
+                        continue;
+                    }
+                    let blocks = lower_message_content(me.message.content);
+                    if blocks.is_empty() {
+                        continue;
+                    }
+                    self.messages.push(Message {
+                        index: next_index,
+                        role: Role::Assistant,
+                        uuid: me.uuid,
+                        timestamp: me.timestamp,
+                        blocks,
+                    });
                     next_index += 1;
                 }
+                Event::System(se) => {
+                    if self.session_id.is_empty() {
+                        self.session_id = se.session_id.clone();
+                    }
+                    if let Some(msg) = lower_system_event(se, next_index) {
+                        self.messages.push(msg);
+                        next_index += 1;
+                    }
+                }
+                Event::Attachment(ae) => {
+                    if let Some(msg) = lower_attachment_event(ae, next_index, &mut self.session_id)
+                    {
+                        self.messages.push(msg);
+                        next_index += 1;
+                    }
+                }
+                // Opaque telemetry — intentionally dropped.
+                Event::Progress(_)
+                | Event::QueueOperation(_)
+                | Event::LastPrompt(_)
+                | Event::FileHistorySnapshot(_)
+                | Event::PrLink(_)
+                | Event::PermissionMode(_)
+                | Event::CustomTitle(_)
+                | Event::AgentName(_)
+                | Event::Unknown => {}
             }
-            // Opaque telemetry — intentionally dropped.
-            Event::Progress(_)
-            | Event::QueueOperation(_)
-            | Event::LastPrompt(_)
-            | Event::FileHistorySnapshot(_)
-            | Event::PrLink(_)
-            | Event::PermissionMode(_)
-            | Event::CustomTitle(_)
-            | Event::AgentName(_)
-            | Event::Unknown => {}
         }
     }
-
-    out
 }
 
 fn capture_meta(out: &mut Transcript, me: &MessageEvent) {
@@ -582,6 +653,122 @@ mod tests {
         let err = load_from_path(&path).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("no valid JSONL events"), "got: {msg}");
+    }
+
+    #[test]
+    fn append_events_extends_existing_transcript_with_sequential_indices() {
+        let mut t = from_events(events(&[
+            r#"{"type":"user","uuid":"u1","sessionId":"s1","timestamp":"t","cwd":"/proj","message":{"role":"user","content":"a"}}"#,
+        ]));
+        assert_eq!(t.messages.len(), 1);
+        assert_eq!(t.messages[0].index, 0);
+
+        t.append_events(events(&[
+            r#"{"type":"assistant","uuid":"a1","sessionId":"s1","timestamp":"t","message":{"role":"assistant","content":[{"type":"text","text":"b"}]}}"#,
+            r#"{"type":"user","uuid":"u2","sessionId":"s1","timestamp":"t","message":{"role":"user","content":"c"}}"#,
+        ]));
+        assert_eq!(t.messages.len(), 3);
+        let indices: Vec<usize> = t.messages.iter().map(|m| m.index).collect();
+        assert_eq!(indices, vec![0, 1, 2]);
+        // Session metadata from the original event is preserved.
+        assert_eq!(t.session_id, "s1");
+        assert_eq!(t.project.as_deref(), Some("/proj"));
+    }
+
+    #[test]
+    fn append_events_on_empty_transcript_matches_from_events() {
+        let lines = &[
+            r#"{"type":"user","uuid":"u1","sessionId":"s1","timestamp":"t","message":{"role":"user","content":"hi"}}"#,
+            r#"{"type":"assistant","uuid":"a1","sessionId":"s1","timestamp":"t","message":{"role":"assistant","content":[{"type":"text","text":"hello"}]}}"#,
+        ];
+        let a = from_events(events(lines));
+        let mut b = Transcript::default();
+        b.append_events(events(lines));
+        assert_eq!(a.messages.len(), b.messages.len());
+        for (m_a, m_b) in a.messages.iter().zip(b.messages.iter()) {
+            assert_eq!(m_a.index, m_b.index);
+            assert_eq!(m_a.role, m_b.role);
+            assert_eq!(m_a.uuid, m_b.uuid);
+        }
+    }
+
+    #[test]
+    fn append_events_drops_sidechains_like_from_events() {
+        let mut t = from_events(std::iter::empty());
+        t.append_events(events(&[
+            r#"{"type":"user","uuid":"u1","sessionId":"s1","timestamp":"t","isSidechain":true,"message":{"role":"user","content":"sub"}}"#,
+            r#"{"type":"user","uuid":"u2","sessionId":"s1","timestamp":"t","message":{"role":"user","content":"primary"}}"#,
+        ]));
+        assert_eq!(t.messages.len(), 1);
+        assert_eq!(t.messages[0].uuid, "u2");
+    }
+
+    #[test]
+    fn load_from_path_parses_unterminated_trailing_line() {
+        // Regression: load_from_path_with_offset intentionally skips
+        // the trailing fragment so the tail reader can reassemble it,
+        // but the static load path (no tail) has to read it or the
+        // final message is silently dropped.
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("midwrite.jsonl");
+        let mut f = File::create(&path).unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"user","uuid":"u1","sessionId":"s1","timestamp":"t","message":{{"role":"user","content":"first"}}}}"#
+        )
+        .unwrap();
+        // Second line — complete JSON but no trailing newline.
+        write!(
+            f,
+            r#"{{"type":"assistant","uuid":"a1","sessionId":"s1","timestamp":"t","message":{{"role":"assistant","content":[{{"type":"text","text":"second"}}]}}}}"#
+        )
+        .unwrap();
+        drop(f);
+
+        let t = load_from_path(&path).unwrap();
+        assert_eq!(t.messages.len(), 2);
+        assert_eq!(t.messages[0].role, Role::User);
+        assert_eq!(t.messages[1].role, Role::Assistant);
+    }
+
+    #[test]
+    fn load_from_path_with_offset_stops_at_last_newline() {
+        // Regression for PJH-51 review finding: when the file ends with
+        // an unterminated trailing fragment (Claude Code still writing),
+        // load_from_path_with_offset must return an offset that excludes
+        // that fragment so the tail reader can reassemble the event once
+        // the final `\n` arrives. Otherwise TailReader::open_at seeks
+        // past the incomplete line and silently loses the event.
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("midwrite.jsonl");
+        let mut f = File::create(&path).unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"user","uuid":"u1","sessionId":"s1","timestamp":"t","message":{{"role":"user","content":"complete"}}}}"#
+        )
+        .unwrap();
+        // Trailing fragment — no newline. 50 bytes of a half-written event.
+        write!(f, r#"{{"type":"assistant","uuid":"a1","ses"#).unwrap();
+        drop(f);
+
+        let (t, offset) = load_from_path_with_offset(&path).unwrap();
+        // The complete line parses; the fragment is not counted.
+        assert_eq!(t.messages.len(), 1);
+        assert_eq!(t.messages[0].role, Role::User);
+        // Offset should land exactly at the end of the first line,
+        // leaving the fragment on disk for the tail reader.
+        let total_len = std::fs::metadata(&path).unwrap().len();
+        assert!(
+            offset < total_len,
+            "offset {offset} must be less than total_len {total_len}"
+        );
+        // And it should equal the length of the first newline-terminated
+        // line (the one the parser consumed).
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let first_newline = raw.find('\n').unwrap() + 1;
+        assert_eq!(offset as usize, first_newline);
     }
 
     #[test]

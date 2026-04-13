@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use anyhow::Result;
 use ccs_core::checkpoints;
 use ccs_core::session::SessionFile;
@@ -5,9 +7,16 @@ use ccs_core::transcript;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::DefaultTerminal;
 
+use crate::tail::LiveTail;
 use crate::ui;
 use crate::ui::picker::PickerState;
 use crate::ui::transcript::{handle_key as handle_transcript_key, Action, TranscriptState};
+
+/// How long the event loop blocks on a keypress before checking the
+/// live-tail file for new data. 100 ms keeps end-to-end latency under
+/// 200 ms (well below PJH-51's 500 ms target) while adding no
+/// perceptible input lag for the non-live picker and viewer screens.
+const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Top-level screen the app is currently rendering.
 ///
@@ -28,6 +37,10 @@ pub struct ViewerScreen {
     pub live: bool,
     pub session: Option<SessionFile>,
     pub state: Option<TranscriptState>,
+    /// Live-tail driver, present only when `live` is true and a session
+    /// path is known. Polled once per event-loop tick when no key
+    /// events are waiting.
+    pub tail: Option<LiveTail>,
 }
 
 impl Screen {
@@ -38,6 +51,7 @@ impl Screen {
             live,
             session,
             state: None,
+            tail: None,
         }));
         screen.hydrate();
         screen
@@ -46,15 +60,31 @@ impl Screen {
     /// Eagerly load a session file into a [`TranscriptState`] when one is
     /// present. Called once on screen entry; failures are logged and fall
     /// through to an empty-state viewer so the user still has a way back
-    /// to the picker.
+    /// to the picker. When `live` is set and a session path is known,
+    /// also opens a `LiveTail` driver seeded at the end-of-file offset
+    /// from the initial load so the event loop can start polling for
+    /// new events atomically (no lost writes, no replayed ones).
     fn hydrate(&mut self) {
         if let Screen::Viewer(v) = self {
             if let (Some(session), None) = (&v.session, &v.state) {
-                match transcript::load_from_path(&session.path) {
-                    Ok(t) => {
-                        let mut state = TranscriptState::new(t);
+                match transcript::load_from_path_with_offset(&session.path) {
+                    Ok((t, offset)) => {
+                        let mut state = if v.live {
+                            TranscriptState::new_live(t)
+                        } else {
+                            TranscriptState::new(t)
+                        };
                         if let Some(path) = checkpoints::marks_path() {
                             state.attach_marks_file(path);
+                        }
+                        if v.live {
+                            v.tail = Some(LiveTail::new_at(session.path.clone(), offset));
+                            // Cursor-to-tail happens inside the first
+                            // `relayout` via `needs_initial_bottom`,
+                            // latched by `TranscriptState::new_live`.
+                            // Calling `jump_bottom` here would no-op
+                            // because `lines` is still empty until
+                            // the first viewport is known.
                         }
                         v.state = Some(state);
                     }
@@ -89,17 +119,78 @@ impl App {
     pub fn run(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
         tracing::info!("entering tui run loop");
         while !self.should_quit {
+            // Poll the live-tail file first so any new events appear
+            // in this frame rather than the next one.
+            self.poll_live_tail();
+
             terminal.draw(|frame| match &mut self.screen {
                 Screen::Picker(state) => ui::picker::render(frame, state),
                 Screen::Viewer(v) => ui::viewer::render(frame, v.live, v.state.as_mut()),
             })?;
+
+            // Block on a key for up to EVENT_POLL_INTERVAL. If nothing
+            // arrives we fall out of `handle_event` as a no-op and
+            // loop back into another `poll_live_tail` + redraw tick.
             self.handle_event()?;
             self.process_screen_transitions();
         }
         Ok(())
     }
 
+    fn poll_live_tail(&mut self) {
+        let Screen::Viewer(v) = &mut self.screen else {
+            return;
+        };
+        let (Some(tail), Some(state)) = (v.tail.as_mut(), v.state.as_mut()) else {
+            return;
+        };
+        match tail.poll() {
+            Ok(update) if update.is_empty() => {}
+            Ok(update) => {
+                if update.errors_skipped > 0 {
+                    state.set_flash(format!(
+                        "live-tail skipped {} malformed line(s)",
+                        update.errors_skipped
+                    ));
+                }
+                if update.reset {
+                    // File was rewritten under us. Reload from disk
+                    // and replace the transcript wholesale; the live
+                    // tail reader already seeked back to 0. If the
+                    // reload fails we must NOT keep the old
+                    // transcript — the tail reader will start
+                    // streaming the new file on top of stale messages
+                    // and mix two timelines. Fall back to an empty
+                    // transcript so subsequent polls produce a clean
+                    // rebuild.
+                    if let Some(session) = v.session.as_ref() {
+                        match transcript::load_from_path(&session.path) {
+                            Ok(fresh) => state.reset_transcript(fresh),
+                            Err(err) => {
+                                tracing::error!(
+                                    path = %session.path.display(),
+                                    error = %err,
+                                    "reload after tail reset failed — clearing transcript",
+                                );
+                                state.reset_transcript(ccs_core::transcript::Transcript::default());
+                                state.set_flash("session compacted; reload failed");
+                            }
+                        }
+                    }
+                } else {
+                    state.append_events(update.new_events);
+                }
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "live-tail poll failed");
+            }
+        }
+    }
+
     fn handle_event(&mut self) -> Result<()> {
+        if !event::poll(EVENT_POLL_INTERVAL)? {
+            return Ok(());
+        }
         let Event::Key(key) = event::read()? else {
             return Ok(());
         };

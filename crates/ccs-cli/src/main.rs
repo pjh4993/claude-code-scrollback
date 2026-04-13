@@ -40,7 +40,22 @@ fn main() -> Result<()> {
     let _log_guard = logging::init(cli.log_level.as_deref(), cli.log_format)?;
 
     let initial = match (cli.live, cli.session) {
-        (true, _) => Screen::viewer(true, None),
+        (true, explicit) => {
+            // `--live` with an explicit session id/path opens that one
+            // and follows it; `--live` alone auto-detects the active
+            // session under the current cwd's project. An explicit
+            // target that resolves to nothing is a hard error — live
+            // mode has no useful empty state and a silent fall-through
+            // to an empty viewer would bury the typo.
+            let session = match explicit {
+                Some(target) => match resolve_session_target(&target)? {
+                    Some(s) => Some(s),
+                    None => anyhow::bail!("unknown session id or path: {target}"),
+                },
+                None => resolve_active_session()?,
+            };
+            Screen::viewer(true, session)
+        }
         (false, Some(target)) => Screen::viewer(false, resolve_session_target(&target)?),
         (false, None) => Screen::Picker(build_picker()?),
     };
@@ -109,6 +124,32 @@ fn looks_like_path(target: &str) -> bool {
         || target.contains('/')
         || target.contains('\\')
         || target.starts_with('.')
+}
+
+/// Resolve the active session for `--live` with no explicit target.
+/// Finds the newest JSONL under the current cwd's project whose mtime
+/// is within [`session::DEFAULT_ACTIVE_WITHIN`]. Errors out with a
+/// clear message if nothing matches — live-tail has no fallback other
+/// than silently dropping the user back at an empty viewer.
+fn resolve_active_session() -> Result<Option<SessionFile>> {
+    let cwd = std::env::current_dir()?;
+    match session::active_session(&cwd, session::DEFAULT_ACTIVE_WITHIN)? {
+        Some(s) => {
+            tracing::info!(
+                path = %s.path.display(),
+                session_id = %s.session_id,
+                "resolved active session for --live",
+            );
+            Ok(Some(s))
+        }
+        None => {
+            anyhow::bail!(
+                "no active session found under {} (no JSONL modified in the last {}s)",
+                cwd.display(),
+                session::DEFAULT_ACTIVE_WITHIN.as_secs(),
+            );
+        }
+    }
 }
 
 /// Synthesize a [`SessionFile`] for an arbitrary path on disk. Used by the

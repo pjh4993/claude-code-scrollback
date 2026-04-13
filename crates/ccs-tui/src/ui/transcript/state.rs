@@ -4,6 +4,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 
 use ccs_core::checkpoints::{self, Mark, SessionMarks};
+use ccs_core::jsonl::Event;
 use ccs_core::transcript::{Block, Transcript};
 use ratatui::text::Line;
 
@@ -93,6 +94,24 @@ pub struct TranscriptState {
     /// used by unit tests to avoid writing to the user's home directory.
     marks_path: Option<PathBuf>,
 
+    /// Live-tail mode: the underlying session file is still being
+    /// written, and the viewer wants to follow new events.
+    live: bool,
+
+    /// Follow-mode: when `true`, any new events appended via
+    /// [`append_events`] re-pin the cursor to the bottom of the
+    /// transcript so the user sees new content without scrolling.
+    /// Manual scrolling (`j`/`k`/`Ctrl-d`/`Ctrl-u`/`gg`) disables
+    /// follow-mode; `G` and `F` re-engage it.
+    follow: bool,
+
+    /// Latched request to snap to the bottom on the first non-empty
+    /// relayout. `new_live` sets this because `hydrate` runs before
+    /// the first viewport is known: at construction time `lines` is
+    /// empty and `jump_bottom` would no-op. The flag is consumed the
+    /// first time `relayout` produces a non-empty cache.
+    needs_initial_bottom: bool,
+
     /// In-viewer search UI mode. Owns the query buffer, committed
     /// matches, and the current match cursor.
     search: SearchMode,
@@ -122,9 +141,87 @@ impl TranscriptState {
             pending_quote: false,
             marks: SessionMarks::new(),
             marks_path: None,
+            live: false,
+            follow: false,
+            needs_initial_bottom: false,
             search: SearchMode::new(),
             flash: None,
             dirty: true,
+        }
+    }
+
+    /// Construct a state for a live-tail viewer: the same as [`new`]
+    /// but `live` and `follow` default to `true` so new events pin the
+    /// cursor to the bottom until the user scrolls up manually. Also
+    /// latches `needs_initial_bottom` so the first non-empty relayout
+    /// pins the cursor to the tail — which is what a live-tail user
+    /// actually wants to see on open, rather than the top of the
+    /// backlog.
+    pub fn new_live(transcript: Transcript) -> Self {
+        let mut s = Self::new(transcript);
+        s.live = true;
+        s.follow = true;
+        s.needs_initial_bottom = true;
+        s
+    }
+
+    pub fn is_live(&self) -> bool {
+        self.live
+    }
+
+    pub fn is_following(&self) -> bool {
+        self.follow
+    }
+
+    /// Explicitly toggle live follow-mode. No-op when not live-tailing.
+    pub fn toggle_follow(&mut self) {
+        if !self.live {
+            return;
+        }
+        self.follow = !self.follow;
+        if self.follow {
+            self.jump_bottom();
+            self.set_flash("follow: on");
+        } else {
+            self.set_flash("follow: off");
+        }
+    }
+
+    /// Append newly-observed events to the transcript and refresh the
+    /// line cache. If follow-mode is on, re-pins the cursor to the
+    /// bottom so the user sees the new events immediately. No-op when
+    /// `events` is empty.
+    pub fn append_events(&mut self, events: impl IntoIterator<Item = Event>) {
+        let before = self.transcript.messages.len();
+        self.transcript.append_events(events);
+        if self.transcript.messages.len() == before {
+            return;
+        }
+        self.dirty = true;
+        self.relayout();
+        if self.follow {
+            self.jump_bottom();
+        }
+    }
+
+    /// Replace the entire transcript — used after a `TailReader`
+    /// rewrite (compaction) where the on-disk line order has changed.
+    /// Cursor / scroll state is preserved when possible but follow
+    /// mode snaps to the bottom to keep the user at the new head.
+    ///
+    /// Clears the collapse set and marks because `BlockId` and
+    /// `Mark` are positional (`msg_index`, `block_index`): after
+    /// compaction those coordinates refer to different blocks (or
+    /// none), so keeping the old entries would quietly decorate
+    /// random unrelated blocks and land jumps on the wrong turn.
+    pub fn reset_transcript(&mut self, transcript: Transcript) {
+        self.transcript = transcript;
+        self.collapsed.clear();
+        self.marks.clear();
+        self.dirty = true;
+        self.relayout();
+        if self.follow {
+            self.jump_bottom();
         }
     }
 
@@ -202,6 +299,15 @@ impl TranscriptState {
         if self.cursor >= self.lines.len() {
             self.cursor = self.lines.len().saturating_sub(1);
         }
+        // Consume the latched "jump to bottom on first real layout"
+        // flag set by `new_live`. Without this, a live-tail viewer
+        // opened against an existing backlog would display the top
+        // of the backlog until a new tail event arrived, because
+        // `new_live` runs before the first viewport is known.
+        if self.needs_initial_bottom && !self.lines.is_empty() {
+            self.cursor = self.lines.len() - 1;
+            self.needs_initial_bottom = false;
+        }
         self.clamp_scroll();
     }
 
@@ -221,13 +327,25 @@ impl TranscriptState {
 
     // --- navigation -------------------------------------------------------
 
+    /// Manual scroll keys break follow-mode: if the user is steering
+    /// the cursor themselves, auto-scrolling on new events would yank
+    /// them away from what they're reading.
+    fn disable_follow_on_manual_scroll(&mut self) {
+        if self.follow {
+            self.follow = false;
+            self.set_flash("paused (press F or G to follow)");
+        }
+    }
+
     pub fn move_down(&mut self, n: usize) {
+        self.disable_follow_on_manual_scroll();
         let max = self.lines.len().saturating_sub(1);
         self.cursor = (self.cursor + n).min(max);
         self.clamp_scroll();
     }
 
     pub fn move_up(&mut self, n: usize) {
+        self.disable_follow_on_manual_scroll();
         self.cursor = self.cursor.saturating_sub(n);
         self.clamp_scroll();
     }
@@ -243,6 +361,7 @@ impl TranscriptState {
     }
 
     pub fn jump_top(&mut self) {
+        self.disable_follow_on_manual_scroll();
         self.cursor = 0;
         self.scroll = 0;
     }
@@ -250,10 +369,16 @@ impl TranscriptState {
     pub fn jump_bottom(&mut self) {
         self.cursor = self.lines.len().saturating_sub(1);
         self.clamp_scroll();
+        // G always re-engages follow mode in live sessions — it's how
+        // the user explicitly asks for "take me to the head again".
+        if self.live {
+            self.follow = true;
+        }
     }
 
     /// Jump the cursor to the next user-turn line (`}`).
     pub fn jump_next_user_turn(&mut self) {
+        self.disable_follow_on_manual_scroll();
         let next = self
             .user_turn_line_starts
             .iter()
@@ -270,6 +395,7 @@ impl TranscriptState {
 
     /// Jump the cursor to the previous user-turn line (`{`).
     pub fn jump_prev_user_turn(&mut self) {
+        self.disable_follow_on_manual_scroll();
         let prev = self
             .user_turn_line_starts
             .iter()
@@ -571,4 +697,171 @@ fn is_collapsible(block: &Block) -> bool {
         block,
         Block::Thinking(_) | Block::ToolCall { .. } | Block::ToolResult { .. }
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ccs_core::jsonl::parse_line;
+    use ccs_core::transcript::from_events;
+
+    fn t_with(lines: &[&str]) -> Transcript {
+        from_events(lines.iter().map(|l| parse_line(l).unwrap()))
+    }
+
+    fn event(line: &str) -> Event {
+        parse_line(line).unwrap()
+    }
+
+    #[test]
+    fn new_live_starts_in_follow_mode() {
+        let t = t_with(&[
+            r#"{"type":"user","uuid":"u1","sessionId":"s1","timestamp":"t","message":{"role":"user","content":"hi"}}"#,
+        ]);
+        let mut s = TranscriptState::new_live(t);
+        s.set_viewport(80, 20);
+        assert!(s.is_live());
+        assert!(s.is_following());
+    }
+
+    #[test]
+    fn new_live_with_existing_backlog_lands_cursor_at_bottom() {
+        // Regression: hydrate() no longer calls jump_bottom() because
+        // lines is empty at construction time; the first relayout has
+        // to consume the `needs_initial_bottom` flag instead.
+        let lines: Vec<String> = (0..10)
+            .map(|i| {
+                format!(
+                    r#"{{"type":"user","uuid":"u{i}","sessionId":"s1","timestamp":"t","message":{{"role":"user","content":"msg-{i}"}}}}"#
+                )
+            })
+            .collect();
+        let t: Transcript = from_events(lines.iter().map(|l| parse_line(l).unwrap()));
+        let mut s = TranscriptState::new_live(t);
+        s.set_viewport(80, 20);
+        assert!(
+            !s.lines().is_empty(),
+            "layout should have produced lines by now"
+        );
+        assert_eq!(
+            s.cursor(),
+            s.lines().len() - 1,
+            "live viewer with existing backlog must open at the tail, not the top"
+        );
+    }
+
+    #[test]
+    fn reset_transcript_clears_collapsed_and_marks() {
+        // Regression: BlockId and Mark are positional, so compaction
+        // makes old coordinates meaningless. reset_transcript must
+        // wipe them rather than decorate random new blocks.
+        let t = t_with(&[
+            r#"{"type":"assistant","uuid":"a1","sessionId":"s1","timestamp":"t","message":{"role":"assistant","content":[{"type":"thinking","thinking":"hm"}]}}"#,
+        ]);
+        let mut s = TranscriptState::new_live(t);
+        s.set_viewport(80, 20);
+        // Land cursor on the thinking body, collapse it, and plant a mark.
+        for _ in 0..20 {
+            if let Some(rl) = s.lines().get(s.cursor()) {
+                if rl.block_index == Some(0) && rl.kind == LineKind::Body {
+                    break;
+                }
+            }
+            s.move_down(1);
+        }
+        s.toggle_current_block();
+        assert!(!s.collapsed().is_empty());
+        s.set_mark('a');
+        assert!(s.marks().contains_key(&'a'));
+
+        // Fresh transcript after compaction.
+        let fresh = t_with(&[
+            r#"{"type":"user","uuid":"u1","sessionId":"s1","timestamp":"t","message":{"role":"user","content":"new"}}"#,
+        ]);
+        s.reset_transcript(fresh);
+        assert!(s.collapsed().is_empty());
+        assert!(s.marks().is_empty());
+    }
+
+    #[test]
+    fn append_events_jumps_cursor_to_bottom_when_following() {
+        let t = t_with(&[
+            r#"{"type":"user","uuid":"u1","sessionId":"s1","timestamp":"t","message":{"role":"user","content":"one"}}"#,
+        ]);
+        let mut s = TranscriptState::new_live(t);
+        s.set_viewport(80, 20);
+        let initial_lines = s.lines().len();
+
+        s.append_events(vec![
+            event(r#"{"type":"user","uuid":"u2","sessionId":"s1","timestamp":"t","message":{"role":"user","content":"two"}}"#),
+            event(r#"{"type":"user","uuid":"u3","sessionId":"s1","timestamp":"t","message":{"role":"user","content":"three"}}"#),
+        ]);
+        assert!(s.lines().len() > initial_lines);
+        // Cursor should be pinned to the last rendered line.
+        assert_eq!(s.cursor(), s.lines().len() - 1);
+    }
+
+    #[test]
+    fn manual_scroll_disables_follow_and_append_no_longer_jumps() {
+        let t = t_with(&[
+            r#"{"type":"user","uuid":"u1","sessionId":"s1","timestamp":"t","message":{"role":"user","content":"one"}}"#,
+            r#"{"type":"user","uuid":"u2","sessionId":"s1","timestamp":"t","message":{"role":"user","content":"two"}}"#,
+            r#"{"type":"user","uuid":"u3","sessionId":"s1","timestamp":"t","message":{"role":"user","content":"three"}}"#,
+        ]);
+        let mut s = TranscriptState::new_live(t);
+        s.set_viewport(80, 20);
+        s.jump_bottom();
+        assert!(s.is_following());
+
+        // User scrolls up manually → follow disengages.
+        s.move_up(2);
+        assert!(!s.is_following());
+        let paused_cursor = s.cursor();
+
+        // A new event should not yank the cursor away.
+        s.append_events(vec![event(
+            r#"{"type":"user","uuid":"u4","sessionId":"s1","timestamp":"t","message":{"role":"user","content":"four"}}"#,
+        )]);
+        assert_eq!(s.cursor(), paused_cursor);
+    }
+
+    #[test]
+    fn capital_g_reengages_follow_in_live_mode() {
+        let t = t_with(&[
+            r#"{"type":"user","uuid":"u1","sessionId":"s1","timestamp":"t","message":{"role":"user","content":"one"}}"#,
+            r#"{"type":"user","uuid":"u2","sessionId":"s1","timestamp":"t","message":{"role":"user","content":"two"}}"#,
+        ]);
+        let mut s = TranscriptState::new_live(t);
+        s.set_viewport(80, 20);
+        s.move_up(5);
+        assert!(!s.is_following());
+        s.jump_bottom();
+        assert!(s.is_following());
+    }
+
+    #[test]
+    fn toggle_follow_is_noop_outside_live_mode() {
+        let t = t_with(&[
+            r#"{"type":"user","uuid":"u1","sessionId":"s1","timestamp":"t","message":{"role":"user","content":"one"}}"#,
+        ]);
+        let mut s = TranscriptState::new(t);
+        s.set_viewport(80, 20);
+        assert!(!s.is_live());
+        s.toggle_follow();
+        assert!(!s.is_following());
+    }
+
+    #[test]
+    fn append_empty_slice_is_noop() {
+        let t = t_with(&[
+            r#"{"type":"user","uuid":"u1","sessionId":"s1","timestamp":"t","message":{"role":"user","content":"hi"}}"#,
+        ]);
+        let mut s = TranscriptState::new_live(t);
+        s.set_viewport(80, 20);
+        let before_cursor = s.cursor();
+        let before_lines = s.lines().len();
+        s.append_events(Vec::<Event>::new());
+        assert_eq!(s.cursor(), before_cursor);
+        assert_eq!(s.lines().len(), before_lines);
+    }
 }

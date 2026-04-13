@@ -169,10 +169,32 @@ fn build_status(state: &TranscriptState) -> Line<'static> {
     let project = t.project.as_deref().unwrap_or("-");
     let session_short = short_session_id(&t.session_id);
 
-    let parts = format!(
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    if state.is_live() {
+        let (label, color) = if state.is_following() {
+            ("[live]", Color::Green)
+        } else {
+            ("[paused]", Color::Yellow)
+        };
+        spans.push(Span::styled(
+            label.to_string(),
+            Style::new().fg(color).add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::raw("  "));
+    }
+    spans.push(Span::raw(format!(
         "session {session_short}  ·  project {project}  ·  msg {current_msg}/{total_msgs}  ·  line {current_line}/{total_lines}  ·  q/Esc quit"
-    );
-    Line::from(Span::raw(parts))
+    )));
+    // When live-tail is paused, the default footer doesn't tell the
+    // user how to resume following. Surface the keys explicitly so the
+    // paused state is self-discoverable.
+    if state.is_live() && !state.is_following() {
+        spans.push(Span::styled(
+            "  (F/G to follow)".to_string(),
+            Style::new().fg(Color::Yellow).add_modifier(Modifier::DIM),
+        ));
+    }
+    Line::from(spans)
 }
 
 fn short_session_id(id: &str) -> String {
