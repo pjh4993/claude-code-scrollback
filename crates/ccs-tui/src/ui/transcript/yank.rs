@@ -72,6 +72,7 @@ mod tests {
             role: Role::Assistant,
             uuid: "u1".to_string(),
             timestamp: "2026-04-12T00:00:00Z".to_string(),
+            stop_reason: None,
             blocks,
         }
     }
@@ -140,6 +141,7 @@ mod tests {
             role: Role::System,
             uuid: "u1".to_string(),
             timestamp: "2026-04-12T00:00:00Z".to_string(),
+            stop_reason: None,
             blocks: vec![Block::Text("boot".to_string())],
         };
         let s = format_message(&m);
@@ -154,6 +156,7 @@ mod tests {
             role: Role::User,
             uuid: "u1".to_string(),
             timestamp: String::new(),
+            stop_reason: None,
             blocks: vec![Block::Text("hi".to_string())],
         };
         let s = format_message(&m);
