@@ -23,7 +23,7 @@
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 /// Maximum lines scanned per JSONL when looking for a `cwd` field. The
 /// authoritative `cwd` is on every `user`/`assistant` event, and Claude Code
@@ -239,6 +239,38 @@ pub fn filter_by_cwd(sessions: &[SessionFile], cwd: &Path) -> Vec<SessionFile> {
 /// explicit session id.
 pub fn most_recent(sessions: &[SessionFile]) -> Option<&SessionFile> {
     sessions.iter().max_by_key(|s| s.modified)
+}
+
+/// Default freshness window for [`active_session`]: a session whose JSONL
+/// has not been touched for longer than this is assumed dormant, not
+/// actively being written. Five minutes is long enough to survive a
+/// multi-turn assistant response without a heartbeat and short enough
+/// that an abandoned session doesn't look live the next morning.
+pub const DEFAULT_ACTIVE_WITHIN: Duration = Duration::from_secs(5 * 60);
+
+/// Find the "active" session rooted at `cwd`: the most-recently-modified
+/// session under the current project whose mtime is within `within` of
+/// now. Returns `Ok(None)` when no session matches (project has never
+/// been used, or the last session is stale).
+///
+/// This is the `--live` entry point and also used by live-tail auto-
+/// detect when opening a session that happens to still be being written.
+pub fn active_session(cwd: &Path, within: Duration) -> anyhow::Result<Option<SessionFile>> {
+    let Some(root) = projects_root() else {
+        return Ok(None);
+    };
+    let all = discover(&root)?;
+    let candidates = filter_by_cwd(&all, cwd);
+    let Some(newest) = most_recent(&candidates) else {
+        return Ok(None);
+    };
+    let now = SystemTime::now();
+    match now.duration_since(newest.modified) {
+        Ok(age) if age <= within => Ok(Some(newest.clone())),
+        // File mtime in the future (clock skew, NFS) — accept it.
+        Err(_) => Ok(Some(newest.clone())),
+        Ok(_) => Ok(None),
+    }
 }
 
 #[cfg(test)]

@@ -9,7 +9,6 @@
 //! The UI (`ccs-tui`) consumes this module; the CLI's `ccs print` will too.
 
 use std::fs::File;
-use std::io::{BufRead, BufReader};
 use std::path::Path;
 
 use serde_json::Value;
@@ -74,17 +73,28 @@ pub enum Block {
 /// can surface "this file is not a Claude Code session" instead of
 /// silently rendering an empty transcript.
 pub fn load_from_path(path: &Path) -> anyhow::Result<Transcript> {
-    let file = File::open(path)?;
-    let reader = BufReader::new(file);
+    Ok(load_from_path_with_offset(path)?.0)
+}
+
+/// Like [`load_from_path`] but also returns the byte offset immediately
+/// past the last byte consumed. Live-tail callers (PJH-51) pair the
+/// returned offset with a [`crate::tail::TailReader::open_at`] to make
+/// the initial snapshot race-free: any bytes written after this function
+/// returns will be picked up by the tail reader's next poll, not
+/// silently re-loaded or dropped.
+pub fn load_from_path_with_offset(path: &Path) -> anyhow::Result<(Transcript, u64)> {
+    use std::io::Read;
+    let mut file = File::open(path)?;
+    let mut raw = String::new();
+    let bytes_read = file.read_to_string(&mut raw)? as u64;
     let mut events: Vec<Event> = Vec::new();
     let mut saw_non_empty = false;
-    for (idx, line) in reader.lines().enumerate() {
-        let line = line?;
+    for (idx, line) in raw.lines().enumerate() {
         if line.trim().is_empty() {
             continue;
         }
         saw_non_empty = true;
-        match jsonl::parse_line(&line) {
+        match jsonl::parse_line(line) {
             Ok(ev) => events.push(ev),
             Err(err) => {
                 tracing::warn!(
@@ -99,7 +109,7 @@ pub fn load_from_path(path: &Path) -> anyhow::Result<Transcript> {
     if saw_non_empty && events.is_empty() {
         anyhow::bail!("no valid JSONL events recovered from {}", path.display());
     }
-    Ok(from_events(events))
+    Ok((from_events(events), bytes_read))
 }
 
 /// Build a [`Transcript`] from a stream of parsed events.
@@ -112,75 +122,87 @@ pub fn load_from_path(path: &Path) -> anyhow::Result<Transcript> {
 ///   carries them.
 pub fn from_events(events: impl IntoIterator<Item = Event>) -> Transcript {
     let mut out = Transcript::default();
-    let mut next_index = 0usize;
+    out.append_events(events);
+    out
+}
 
-    for ev in events {
-        match ev {
-            Event::User(me) => {
-                capture_meta(&mut out, &me);
-                if me.is_sidechain {
-                    continue;
-                }
-                let blocks = lower_message_content(me.message.content);
-                if blocks.is_empty() {
-                    continue;
-                }
-                out.messages.push(Message {
-                    index: next_index,
-                    role: Role::User,
-                    uuid: me.uuid,
-                    timestamp: me.timestamp,
-                    blocks,
-                });
-                next_index += 1;
-            }
-            Event::Assistant(me) => {
-                capture_meta(&mut out, &me);
-                if me.is_sidechain {
-                    continue;
-                }
-                let blocks = lower_message_content(me.message.content);
-                if blocks.is_empty() {
-                    continue;
-                }
-                out.messages.push(Message {
-                    index: next_index,
-                    role: Role::Assistant,
-                    uuid: me.uuid,
-                    timestamp: me.timestamp,
-                    blocks,
-                });
-                next_index += 1;
-            }
-            Event::System(se) => {
-                if out.session_id.is_empty() {
-                    out.session_id = se.session_id.clone();
-                }
-                if let Some(msg) = lower_system_event(se, next_index) {
-                    out.messages.push(msg);
+impl Transcript {
+    /// Extend an existing transcript with a stream of new events. Used by
+    /// live-tail (PJH-51) to incorporate lines appended to the JSONL file
+    /// since the last poll without throwing away the existing lowering.
+    ///
+    /// Indices continue from wherever the last extant message left off,
+    /// so callers that cache line-cache offsets keyed on message index
+    /// stay consistent across appends.
+    pub fn append_events(&mut self, events: impl IntoIterator<Item = Event>) {
+        let mut next_index = self.messages.last().map(|m| m.index + 1).unwrap_or(0);
+        for ev in events {
+            match ev {
+                Event::User(me) => {
+                    capture_meta(self, &me);
+                    if me.is_sidechain {
+                        continue;
+                    }
+                    let blocks = lower_message_content(me.message.content);
+                    if blocks.is_empty() {
+                        continue;
+                    }
+                    self.messages.push(Message {
+                        index: next_index,
+                        role: Role::User,
+                        uuid: me.uuid,
+                        timestamp: me.timestamp,
+                        blocks,
+                    });
                     next_index += 1;
                 }
-            }
-            Event::Attachment(ae) => {
-                if let Some(msg) = lower_attachment_event(ae, next_index, &mut out.session_id) {
-                    out.messages.push(msg);
+                Event::Assistant(me) => {
+                    capture_meta(self, &me);
+                    if me.is_sidechain {
+                        continue;
+                    }
+                    let blocks = lower_message_content(me.message.content);
+                    if blocks.is_empty() {
+                        continue;
+                    }
+                    self.messages.push(Message {
+                        index: next_index,
+                        role: Role::Assistant,
+                        uuid: me.uuid,
+                        timestamp: me.timestamp,
+                        blocks,
+                    });
                     next_index += 1;
                 }
+                Event::System(se) => {
+                    if self.session_id.is_empty() {
+                        self.session_id = se.session_id.clone();
+                    }
+                    if let Some(msg) = lower_system_event(se, next_index) {
+                        self.messages.push(msg);
+                        next_index += 1;
+                    }
+                }
+                Event::Attachment(ae) => {
+                    if let Some(msg) = lower_attachment_event(ae, next_index, &mut self.session_id)
+                    {
+                        self.messages.push(msg);
+                        next_index += 1;
+                    }
+                }
+                // Opaque telemetry — intentionally dropped.
+                Event::Progress(_)
+                | Event::QueueOperation(_)
+                | Event::LastPrompt(_)
+                | Event::FileHistorySnapshot(_)
+                | Event::PrLink(_)
+                | Event::PermissionMode(_)
+                | Event::CustomTitle(_)
+                | Event::AgentName(_)
+                | Event::Unknown => {}
             }
-            // Opaque telemetry — intentionally dropped.
-            Event::Progress(_)
-            | Event::QueueOperation(_)
-            | Event::LastPrompt(_)
-            | Event::FileHistorySnapshot(_)
-            | Event::PrLink(_)
-            | Event::PermissionMode(_)
-            | Event::CustomTitle(_)
-            | Event::AgentName(_)
-            | Event::Unknown => {}
         }
     }
-
-    out
 }
 
 fn capture_meta(out: &mut Transcript, me: &MessageEvent) {
@@ -582,6 +604,54 @@ mod tests {
         let err = load_from_path(&path).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("no valid JSONL events"), "got: {msg}");
+    }
+
+    #[test]
+    fn append_events_extends_existing_transcript_with_sequential_indices() {
+        let mut t = from_events(events(&[
+            r#"{"type":"user","uuid":"u1","sessionId":"s1","timestamp":"t","cwd":"/proj","message":{"role":"user","content":"a"}}"#,
+        ]));
+        assert_eq!(t.messages.len(), 1);
+        assert_eq!(t.messages[0].index, 0);
+
+        t.append_events(events(&[
+            r#"{"type":"assistant","uuid":"a1","sessionId":"s1","timestamp":"t","message":{"role":"assistant","content":[{"type":"text","text":"b"}]}}"#,
+            r#"{"type":"user","uuid":"u2","sessionId":"s1","timestamp":"t","message":{"role":"user","content":"c"}}"#,
+        ]));
+        assert_eq!(t.messages.len(), 3);
+        let indices: Vec<usize> = t.messages.iter().map(|m| m.index).collect();
+        assert_eq!(indices, vec![0, 1, 2]);
+        // Session metadata from the original event is preserved.
+        assert_eq!(t.session_id, "s1");
+        assert_eq!(t.project.as_deref(), Some("/proj"));
+    }
+
+    #[test]
+    fn append_events_on_empty_transcript_matches_from_events() {
+        let lines = &[
+            r#"{"type":"user","uuid":"u1","sessionId":"s1","timestamp":"t","message":{"role":"user","content":"hi"}}"#,
+            r#"{"type":"assistant","uuid":"a1","sessionId":"s1","timestamp":"t","message":{"role":"assistant","content":[{"type":"text","text":"hello"}]}}"#,
+        ];
+        let a = from_events(events(lines));
+        let mut b = Transcript::default();
+        b.append_events(events(lines));
+        assert_eq!(a.messages.len(), b.messages.len());
+        for (m_a, m_b) in a.messages.iter().zip(b.messages.iter()) {
+            assert_eq!(m_a.index, m_b.index);
+            assert_eq!(m_a.role, m_b.role);
+            assert_eq!(m_a.uuid, m_b.uuid);
+        }
+    }
+
+    #[test]
+    fn append_events_drops_sidechains_like_from_events() {
+        let mut t = from_events(std::iter::empty());
+        t.append_events(events(&[
+            r#"{"type":"user","uuid":"u1","sessionId":"s1","timestamp":"t","isSidechain":true,"message":{"role":"user","content":"sub"}}"#,
+            r#"{"type":"user","uuid":"u2","sessionId":"s1","timestamp":"t","message":{"role":"user","content":"primary"}}"#,
+        ]));
+        assert_eq!(t.messages.len(), 1);
+        assert_eq!(t.messages[0].uuid, "u2");
     }
 
     #[test]

@@ -149,6 +149,11 @@ pub fn handle_key(state: &mut TranscriptState, key: KeyEvent) -> Action {
             Action::None
         }
 
+        KeyCode::Char('F') => {
+            state.toggle_follow();
+            Action::None
+        }
+
         _ => Action::None,
     }
 }

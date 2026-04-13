@@ -51,9 +51,19 @@ impl TailReader {
     /// Open a tail reader at offset 0. The first [`poll`](Self::poll) call
     /// will return every existing line in the file.
     pub fn open(path: impl Into<PathBuf>) -> Self {
+        Self::open_at(path, 0)
+    }
+
+    /// Open a tail reader already advanced past `offset` bytes. Used by
+    /// live-tail callers that have already parsed the file's current
+    /// contents into an in-memory structure and only want to see bytes
+    /// written *after* that snapshot — combined with the post-read file
+    /// length this eliminates the race where bytes written between the
+    /// snapshot and the tail-reader open would otherwise be lost.
+    pub fn open_at(path: impl Into<PathBuf>, offset: u64) -> Self {
         Self {
             path: path.into(),
-            offset: 0,
+            offset,
             pending: String::new(),
         }
     }
