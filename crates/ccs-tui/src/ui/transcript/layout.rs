@@ -92,9 +92,9 @@ pub fn build(transcript: &Transcript, width: u16, ctx: &CollapseContext<'_>) -> 
 }
 
 /// One-line role-aware preview of a message for the sidebar list.
-/// Pulls the first text block (if any), collapses whitespace, and
-/// truncates. Falls back to the block kind when the message has no
-/// textual content (e.g. a pure tool-call turn).
+/// Pulls the first text block (if any), takes only its first
+/// non-empty line, and truncates. Falls back to the block kind when
+/// the message has no textual content (e.g. a pure tool-call turn).
 fn message_preview(msg: &Message) -> String {
     const MAX: usize = 48;
     let raw = msg
@@ -111,7 +111,10 @@ fn message_preview(msg: &Message) -> String {
             Some(Block::Attachment(_)) => "(attachment)",
             _ => "",
         });
-    let collapsed: String = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    // Take only the first non-empty line so a multi-paragraph message
+    // doesn't get its remaining lines flattened into the preview.
+    let first_line = raw.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+    let collapsed: String = first_line.split_whitespace().collect::<Vec<_>>().join(" ");
     if collapsed.chars().count() > MAX {
         let truncated: String = collapsed.chars().take(MAX - 1).collect();
         format!("{truncated}…")
@@ -618,6 +621,18 @@ mod tests {
         assert_eq!(stops[0].1, "end_turn");
         assert_eq!(stops[0].2, "stop: end_turn");
         assert_eq!(out.lines[stops[0].0].kind, LineKind::Header);
+    }
+
+    #[test]
+    fn user_turn_preview_uses_only_first_line() {
+        // A multi-line user message must preview as just its first
+        // line, not a whitespace-collapsed join of every line.
+        let t = tx(&[
+            r#"{"type":"user","uuid":"u1","sessionId":"s1","timestamp":"t","message":{"role":"user","content":"first line\nsecond line\nthird"}}"#,
+        ]);
+        let out = build_default(&t, 80);
+        let preview = &out.checkpoints[0].preview;
+        assert_eq!(preview, "first line");
     }
 
     #[test]
