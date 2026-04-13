@@ -1,7 +1,9 @@
 //! Owns the transcript, the pre-rendered line cache, and viewport/scroll state.
 
 use std::collections::HashSet;
+use std::path::PathBuf;
 
+use ccs_core::checkpoints::{self, Mark, SessionMarks};
 use ccs_core::transcript::{Block, Transcript};
 use ratatui::text::Line;
 
@@ -79,6 +81,17 @@ pub struct TranscriptState {
 
     /// Pending vim chord state: `g` seen, waiting for the second `g`.
     pending_g: bool,
+    /// Pending `m<letter>` chord: `m` seen, waiting for the mark letter.
+    pending_m: bool,
+    /// Pending `'<letter>` chord: `'` seen, waiting for the jump target.
+    pending_quote: bool,
+
+    /// Manual marks for this session (letter → anchor). Loaded from
+    /// `marks.json` on viewer entry; re-saved on every `m<letter>`.
+    marks: SessionMarks,
+    /// Path to the on-disk `marks.json`. `None` disables persistence —
+    /// used by unit tests to avoid writing to the user's home directory.
+    marks_path: Option<PathBuf>,
 
     /// In-viewer search UI mode. Owns the query buffer, committed
     /// matches, and the current match cursor.
@@ -105,6 +118,10 @@ impl TranscriptState {
             collapsed: HashSet::new(),
             collapse_all: CollapseAll::Off,
             pending_g: false,
+            pending_m: false,
+            pending_quote: false,
+            marks: SessionMarks::new(),
+            marks_path: None,
             search: SearchMode::new(),
             flash: None,
             dirty: true,
@@ -321,6 +338,120 @@ impl TranscriptState {
 
     pub fn set_pending_g(&mut self, pending: bool) {
         self.pending_g = pending;
+    }
+
+    pub fn pending_m(&self) -> bool {
+        self.pending_m
+    }
+
+    pub fn set_pending_m(&mut self, pending: bool) {
+        self.pending_m = pending;
+    }
+
+    pub fn pending_quote(&self) -> bool {
+        self.pending_quote
+    }
+
+    pub fn set_pending_quote(&mut self, pending: bool) {
+        self.pending_quote = pending;
+    }
+
+    // --- marks ------------------------------------------------------------
+
+    /// Point the state at a marks.json file and preload this session's
+    /// marks from it. Called by `app.rs` after constructing the state;
+    /// tests that don't want to touch disk simply skip this.
+    pub fn attach_marks_file(&mut self, path: PathBuf) {
+        let file = checkpoints::load(&path);
+        if let Some(marks) = file.sessions.get(&self.transcript.session_id) {
+            self.marks = marks.clone();
+        }
+        self.marks_path = Some(path);
+    }
+
+    #[cfg(test)]
+    pub fn marks(&self) -> &SessionMarks {
+        &self.marks
+    }
+
+    /// Set the mark `letter` to the current cursor position and persist.
+    /// Letters outside `a..=z` are rejected with a flash — matching vim's
+    /// lowercase-only local marks.
+    pub fn set_mark(&mut self, letter: char) {
+        if !letter.is_ascii_lowercase() {
+            self.set_flash(format!("bad mark '{letter}'"));
+            return;
+        }
+        let Some(line) = self.lines.get(self.cursor) else {
+            self.set_flash("nothing to mark");
+            return;
+        };
+        let mark = Mark {
+            msg_index: line.msg_index,
+            block_index: line.block_index,
+        };
+        self.marks.insert(letter, mark);
+        self.set_flash(format!("mark {letter} set"));
+        self.save_marks();
+    }
+
+    /// Jump the cursor to the position saved under `letter`. Resolves the
+    /// anchor against the current line cache — if the target block has
+    /// since been collapsed, we fall back to the first line whose
+    /// `msg_index` matches, so the jump always lands somewhere reasonable.
+    pub fn jump_to_mark(&mut self, letter: char) {
+        if !letter.is_ascii_lowercase() {
+            self.set_flash(format!("bad mark '{letter}'"));
+            return;
+        }
+        let Some(&mark) = self.marks.get(&letter) else {
+            self.set_flash(format!("no mark {letter}"));
+            return;
+        };
+        let exact = self
+            .lines
+            .iter()
+            .position(|l| l.msg_index == mark.msg_index && l.block_index == mark.block_index);
+        let fallback = exact.or_else(|| {
+            self.lines
+                .iter()
+                .position(|l| l.msg_index == mark.msg_index)
+        });
+        match fallback {
+            Some(line) => {
+                self.cursor = line;
+                self.clamp_scroll();
+                self.set_flash(format!("'{letter}"));
+            }
+            None => self.set_flash(format!("mark {letter} out of range")),
+        }
+    }
+
+    /// Persist the current session's marks back to `marks.json`. Uses
+    /// [`checkpoints::update_session`] so concurrent viewers cannot
+    /// clobber each other's session entries via an interleaved
+    /// read/modify/write.
+    ///
+    /// Merges against `current` rather than overwriting: if the same
+    /// session is open in two viewers, both sides see the union of
+    /// marks — last-write-wins per letter, but letters the other
+    /// viewer set are preserved. Failures are logged but not surfaced;
+    /// a broken home directory should not break the viewer mid-session.
+    fn save_marks(&self) {
+        let Some(path) = self.marks_path.as_ref() else {
+            return;
+        };
+        let local = self.marks.clone();
+        let result = checkpoints::update_session(path, &self.transcript.session_id, |current| {
+            let mut merged = current.cloned().unwrap_or_default();
+            for (letter, mark) in local {
+                merged.insert(letter, mark);
+            }
+            Some(merged)
+        });
+        if let Err(e) = result {
+            tracing::warn!(error = %e, "failed to persist marks.json");
+        }
     }
 
     // --- search -----------------------------------------------------------

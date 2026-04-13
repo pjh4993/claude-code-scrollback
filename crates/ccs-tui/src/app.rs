@@ -1,4 +1,5 @@
 use anyhow::Result;
+use ccs_core::checkpoints;
 use ccs_core::session::SessionFile;
 use ccs_core::transcript;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
@@ -51,7 +52,11 @@ impl Screen {
             if let (Some(session), None) = (&v.session, &v.state) {
                 match transcript::load_from_path(&session.path) {
                     Ok(t) => {
-                        v.state = Some(TranscriptState::new(t));
+                        let mut state = TranscriptState::new(t);
+                        if let Some(path) = checkpoints::marks_path() {
+                            state.attach_marks_file(path);
+                        }
+                        v.state = Some(state);
                     }
                     Err(err) => {
                         tracing::error!(
