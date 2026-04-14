@@ -41,17 +41,46 @@ pub struct ViewerScreen {
     /// path is known. Polled once per event-loop tick when no key
     /// events are waiting.
     pub tail: Option<LiveTail>,
+    /// The picker state this viewer was launched from, parked here
+    /// until the user presses `Esc` to return. `None` when the viewer
+    /// was opened directly from the CLI (`ccs view <path>`, live-tail
+    /// mode) without a picker behind it — in that case `Esc` falls
+    /// through to `Quit` because there is nothing to return to.
+    pub saved_picker: Option<PickerState>,
 }
 
 impl Screen {
     /// Construct a fresh viewer screen, hydrating the transcript if a
-    /// session is provided.
+    /// session is provided. Used by CLI entry points (`ccs tail`,
+    /// `ccs view`) — no picker is parked underneath, so `Esc` in the
+    /// viewer falls through to `Quit`.
     pub fn viewer(live: bool, session: Option<SessionFile>) -> Self {
+        Self::build_viewer(live, session, None)
+    }
+
+    /// Construct a viewer launched from an existing picker. The picker
+    /// state is parked on the viewer so a later `Esc` can return the
+    /// app to exactly the cursor / search / scroll position the user
+    /// left behind.
+    pub fn viewer_from_picker(
+        live: bool,
+        session: Option<SessionFile>,
+        picker: PickerState,
+    ) -> Self {
+        Self::build_viewer(live, session, Some(picker))
+    }
+
+    fn build_viewer(
+        live: bool,
+        session: Option<SessionFile>,
+        saved_picker: Option<PickerState>,
+    ) -> Self {
         let mut screen = Screen::Viewer(Box::new(ViewerScreen {
             live,
             session,
             state: None,
             tail: None,
+            saved_picker,
         }));
         screen.hydrate();
         screen
@@ -198,30 +227,100 @@ impl App {
             return Ok(());
         }
 
-        match &mut self.screen {
-            Screen::Picker(state) => handle_picker_key(state, key.code, &mut self.should_quit),
+        // Compute the viewer-side action (if any) before touching
+        // `self.screen` again, so the subsequent transition code can
+        // move the screen out without fighting the borrow checker.
+        let viewer_action = match &mut self.screen {
+            Screen::Picker(state) => {
+                handle_picker_key(state, key.code, &mut self.should_quit);
+                None
+            }
             Screen::Viewer(v) => {
                 if let Some(state) = v.state.as_mut() {
-                    if handle_transcript_key(state, key) == Action::Quit {
-                        self.should_quit = true;
-                    }
+                    Some(handle_transcript_key(state, key))
+                } else if matches!(key.code, KeyCode::Char('q')) {
+                    Some(Action::Quit)
+                } else if matches!(key.code, KeyCode::Esc) {
+                    // Placeholder viewer (transcript failed to load):
+                    // Esc still means "go back if you can".
+                    Some(Action::BackToPicker)
                 } else {
-                    // Placeholder viewer: only q/Esc to quit.
-                    if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc) {
-                        self.should_quit = true;
-                    }
+                    None
                 }
             }
+        };
+
+        match viewer_action {
+            None | Some(Action::None) => {}
+            Some(Action::Quit) => self.should_quit = true,
+            Some(Action::BackToPicker) => self.return_to_picker(),
         }
         Ok(())
     }
 
-    fn process_screen_transitions(&mut self) {
-        if let Screen::Picker(state) = &mut self.screen {
-            if let Some(session) = state.take_open_request() {
-                self.screen = Screen::viewer(false, Some(session));
-            }
+    /// Swap the viewer out for its parked picker state. When the
+    /// viewer was opened without a saved picker (CLI entry point),
+    /// fall through to `Quit` — there's nothing to return to.
+    fn return_to_picker(&mut self) {
+        // Placeholder used only to move the old `Screen::Viewer` out
+        // of `self.screen` by value. It is never observed because we
+        // reassign `self.screen` unconditionally below.
+        let placeholder = Screen::Viewer(Box::new(ViewerScreen {
+            live: false,
+            session: None,
+            state: None,
+            tail: None,
+            saved_picker: None,
+        }));
+        match std::mem::replace(&mut self.screen, placeholder) {
+            Screen::Viewer(mut v) => match v.saved_picker.take() {
+                Some(picker) => {
+                    self.screen = Screen::Picker(picker);
+                }
+                None => {
+                    // Viewer opened directly from the CLI — no picker
+                    // behind it. Restore and quit.
+                    self.screen = Screen::Viewer(v);
+                    self.should_quit = true;
+                }
+            },
+            // Unreachable: we only call this after matching Viewer.
+            // Put it back if we somehow got here anyway.
+            other => self.screen = other,
         }
+    }
+
+    fn process_screen_transitions(&mut self) {
+        // Picker → Viewer: the user pressed Enter on a row. Move the
+        // picker state into the new viewer so a later `Esc` can
+        // return us to the same cursor / search / scroll position.
+        let pending_open = if let Screen::Picker(state) = &mut self.screen {
+            state.take_open_request()
+        } else {
+            None
+        };
+        let Some(session) = pending_open else {
+            return;
+        };
+        // Move the PickerState out of `self.screen` by value. The
+        // placeholder is only here to satisfy `mem::replace`; we
+        // overwrite `self.screen` before anyone sees it.
+        let placeholder = Screen::Viewer(Box::new(ViewerScreen {
+            live: false,
+            session: None,
+            state: None,
+            tail: None,
+            saved_picker: None,
+        }));
+        let picker = match std::mem::replace(&mut self.screen, placeholder) {
+            Screen::Picker(state) => state,
+            // Unreachable because `pending_open` was `Some`.
+            other => {
+                self.screen = other;
+                return;
+            }
+        };
+        self.screen = Screen::viewer_from_picker(false, Some(session), picker);
     }
 }
 
@@ -256,5 +355,127 @@ fn handle_picker_key(state: &mut PickerState, code: KeyCode, should_quit: &mut b
         KeyCode::Char('/') => state.enter_search(),
         KeyCode::Enter => state.request_open(),
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ccs_core::metadata::NullSource;
+    use ccs_core::session::{SessionFile, SessionKind};
+    use std::path::PathBuf;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    fn fake_session(id: &str) -> SessionFile {
+        SessionFile {
+            session_id: id.into(),
+            parent_session_id: None,
+            kind: SessionKind::Primary,
+            // Deliberately-nonexistent path so hydrate() fails cleanly
+            // and the viewer lands in its placeholder state. We only
+            // care about the transition, not the transcript itself.
+            path: PathBuf::from(format!("/definitely/does/not/exist/{id}.jsonl")),
+            project_cwd: PathBuf::from("/tmp"),
+            modified: UNIX_EPOCH + Duration::from_secs(100),
+            size: 0,
+        }
+    }
+
+    fn picker_with(sessions: Vec<SessionFile>) -> PickerState {
+        PickerState::new(sessions, Box::new(NullSource), None)
+    }
+
+    #[test]
+    fn enter_moves_picker_state_into_viewer_saved_picker() {
+        // Landing on the viewer via Enter must park the picker state
+        // on `saved_picker` — if we drop it, there's nothing to return
+        // to and `Esc` has to quit the whole process.
+        let mut picker = picker_with(vec![fake_session("a"), fake_session("b")]);
+        picker.move_down();
+        picker.request_open();
+
+        let mut app = App::new(Screen::Picker(picker));
+        app.process_screen_transitions();
+
+        match &app.screen {
+            Screen::Viewer(v) => assert!(
+                v.saved_picker.is_some(),
+                "picker state must be parked on the viewer"
+            ),
+            Screen::Picker(_) => panic!("transition did not fire"),
+        }
+    }
+
+    #[test]
+    fn back_to_picker_restores_cursor_position() {
+        // Round trip: picker cursor must survive the viewer detour.
+        // This is the PJH-65 Step 3 acceptance check — "close the
+        // session and return to the same row you opened from".
+        let mut picker = picker_with(vec![
+            fake_session("a"),
+            fake_session("b"),
+            fake_session("c"),
+        ]);
+        picker.move_down();
+        picker.move_down();
+        let cursor_before = picker.cursor();
+        assert!(cursor_before > 0, "test precondition: cursor moved");
+        picker.request_open();
+
+        let mut app = App::new(Screen::Picker(picker));
+        app.process_screen_transitions();
+        assert!(matches!(app.screen, Screen::Viewer(_)));
+
+        app.return_to_picker();
+
+        match &app.screen {
+            Screen::Picker(p) => {
+                assert_eq!(p.cursor(), cursor_before, "picker cursor not preserved");
+            }
+            Screen::Viewer(_) => panic!("return_to_picker did not restore the picker"),
+        }
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn back_to_picker_preserves_search_query() {
+        // The picker's search query (and therefore its filtered row
+        // list) must also survive the round trip. We pick a query
+        // that still matches at least one row so `request_open` can
+        // fire — otherwise filtered becomes empty and the transition
+        // never happens.
+        let mut picker = picker_with(vec![
+            fake_session("alpha"),
+            fake_session("beta"),
+            fake_session("gamma"),
+        ]);
+        picker.enter_search();
+        picker.push_search_char('a'); // matches alpha, beta, gamma
+        picker.exit_search();
+        let query_before = picker.search_query().to_string();
+        assert_eq!(query_before, "a");
+        picker.request_open();
+
+        let mut app = App::new(Screen::Picker(picker));
+        app.process_screen_transitions();
+        app.return_to_picker();
+
+        match &app.screen {
+            Screen::Picker(p) => assert_eq!(p.search_query(), query_before),
+            Screen::Viewer(_) => panic!("return_to_picker did not restore the picker"),
+        }
+    }
+
+    #[test]
+    fn back_to_picker_from_cli_viewer_quits() {
+        // A viewer constructed without a saved picker (the CLI
+        // `ccs view <path>` entry point) has nothing to return to —
+        // BackToPicker must fall through to Quit.
+        let mut app = App::new(Screen::viewer(false, None));
+        app.return_to_picker();
+        assert!(
+            app.should_quit,
+            "no-picker viewer must quit on BackToPicker"
+        );
     }
 }

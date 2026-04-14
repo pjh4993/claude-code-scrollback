@@ -140,6 +140,13 @@ impl PickerState {
         &self.search_query
     }
 
+    /// Cursor position into the filtered row list. Exposed so callers
+    /// (and tests) that care about state preservation across viewer
+    /// round trips can assert the picker resumed where it left off.
+    pub fn cursor(&self) -> usize {
+        self.cursor
+    }
+
     /// Consume a pending open request, returning the selected session if
     /// one was staged by [`request_open`](Self::request_open).
     pub fn take_open_request(&mut self) -> Option<SessionFile> {

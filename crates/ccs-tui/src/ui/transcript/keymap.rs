@@ -14,7 +14,13 @@ use crate::clipboard;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
     None,
+    /// Exit the process entirely. Bound to `q`.
     Quit,
+    /// Return to the picker screen with its prior state preserved,
+    /// falling through to `Quit` when the viewer was opened without a
+    /// picker behind it (e.g. `ccs view <path>` from the CLI). Bound
+    /// to `Esc`.
+    BackToPicker,
 }
 
 /// Consume a `KeyEvent` and mutate `state` accordingly.
@@ -32,7 +38,8 @@ pub enum Action {
 /// * `/`                          — begin search
 /// * `n` / `N`                    — next / prev search match (in active search)
 /// * `y`                          — yank current message to clipboard
-/// * `q` / `Esc`                  — quit
+/// * `q`                          — quit the process
+/// * `Esc`                        — return to picker (or quit if there is none)
 ///
 /// While search is typing: `Enter` commits, `Esc` cancels, `Backspace`
 /// deletes one char, any other character extends the query.
@@ -69,7 +76,8 @@ pub fn handle_key(state: &mut TranscriptState, key: KeyEvent) -> Action {
     }
 
     match key.code {
-        KeyCode::Char('q') | KeyCode::Esc => Action::Quit,
+        KeyCode::Char('q') => Action::Quit,
+        KeyCode::Esc => Action::BackToPicker,
 
         KeyCode::Char('j') | KeyCode::Down => {
             state.move_down(1);
@@ -244,10 +252,13 @@ mod tests {
     }
 
     #[test]
-    fn q_and_esc_both_quit() {
+    fn q_quits_and_esc_returns_to_picker() {
+        // `q` still means "exit the process entirely". `Esc` now asks
+        // the app layer to return to the picker — the app falls back
+        // to `Quit` when there is no picker behind the viewer.
         let mut s = state_with_n_messages(1);
         assert_eq!(handle_key(&mut s, key(KeyCode::Char('q'))), Action::Quit);
-        assert_eq!(handle_key(&mut s, key(KeyCode::Esc)), Action::Quit);
+        assert_eq!(handle_key(&mut s, key(KeyCode::Esc)), Action::BackToPicker,);
     }
 
     #[test]
