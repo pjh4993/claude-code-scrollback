@@ -2,7 +2,7 @@
 
 ## Prerequisites
 
-- **Rust toolchain** — stable Rust (1.75+ recommended). Install via [rustup](https://rustup.rs/).
+- **Rust toolchain** — stable Rust **1.75 or newer is required** (the workspace pins `rust-version = "1.75"`). Install via [rustup](https://rustup.rs/).
 - **Claude Code** — `claude-code-scrollback` reads session files from `~/.claude/projects/`, which is populated by the [Claude Code](https://claude.com/claude-code) CLI. You don't need Claude Code running to browse history, but you do need it installed to have sessions to view.
 
 ## `cargo install` from git (recommended)
@@ -42,4 +42,12 @@ The release binary is around **2.6 MB** on macOS arm64 (well under PJH-53's 20 M
 
 ## Uninstall
 
-Remove the binary you copied (e.g. `rm ~/.local/bin/claude-code-scrollback`). Log files under the OS cache directory (see [contributing.md](./contributing.md#logs)) can be deleted manually if you want to clean up state.
+If you installed via `cargo install --git` (the recommended path):
+
+```bash
+cargo uninstall claude-code-scrollback
+```
+
+If you built from source and copied the binary yourself, remove it from wherever you put it (e.g. `rm ~/.local/bin/claude-code-scrollback`).
+
+Log files under the OS cache directory (see [contributing.md](./contributing.md#logs)) can be deleted manually if you want to clean up state.
