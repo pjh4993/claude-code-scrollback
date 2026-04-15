@@ -122,16 +122,42 @@ fn read_cwd_from_jsonl(path: &Path) -> Option<PathBuf> {
     None
 }
 
-/// Enumerate every session JSONL under `root`, returning one [`SessionFile`]
-/// per file. Non-JSONL files and directories without readable metadata are
-/// silently skipped. A missing root returns an empty list rather than an
-/// error — a fresh machine with no Claude Code sessions is not a failure.
+/// Non-fatal outcomes from a discovery pass, surfaced to the picker so
+/// the user sees *why* their session list might be incomplete.
+///
+/// Right now the only counted outcome is project directories that
+/// could not be enumerated (typically `EACCES`). The struct is kept
+/// separate from `Vec<SessionFile>` so we can add more kinds of
+/// skip — malformed names, unreadable metadata — without churning
+/// the `discover` signature again.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct DiscoveryStats {
+    /// Number of project directories that `read_dir` refused. A
+    /// non-zero count is shown in the picker footer and bumps the
+    /// per-dir log to `warn!` so `RUST_LOG=warn` surfaces which ones.
+    pub skipped_dirs: usize,
+}
+
+impl DiscoveryStats {
+    pub fn is_clean(&self) -> bool {
+        self.skipped_dirs == 0
+    }
+}
+
+/// Enumerate every session JSONL under `root`, returning the
+/// [`SessionFile`]s plus a [`DiscoveryStats`] summary. Non-JSONL files
+/// are silently skipped as before; project directories that cannot
+/// be read are counted and logged at `warn!` so the picker can
+/// display "N dirs skipped" in its footer. A missing root returns
+/// an empty list rather than an error — a fresh machine with no
+/// Claude Code sessions is not a failure.
 #[tracing::instrument(level = "debug", skip_all, fields(root = %root.display()))]
-pub fn discover(root: &Path) -> anyhow::Result<Vec<SessionFile>> {
+pub fn discover(root: &Path) -> anyhow::Result<(Vec<SessionFile>, DiscoveryStats)> {
     let mut out = Vec::new();
+    let mut stats = DiscoveryStats::default();
     let project_dirs = match fs::read_dir(root) {
         Ok(rd) => rd,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((out, stats)),
         Err(e) => return Err(e.into()),
     };
 
@@ -150,7 +176,13 @@ pub fn discover(root: &Path) -> anyhow::Result<Vec<SessionFile>> {
         let sessions = match fs::read_dir(&project_path) {
             Ok(rd) => rd,
             Err(e) => {
-                tracing::trace!(path=?project_path, error=%e, "skipping unreadable project dir");
+                // Bumped from `trace!` — permission-denied under
+                // `~/.claude/projects` is the single most common
+                // reason sessions silently disappear from the
+                // picker, and the user needs a way to see it
+                // without rerunning with `RUST_LOG=trace`.
+                tracing::warn!(path=?project_path, error=%e, "skipping unreadable project dir");
+                stats.skipped_dirs += 1;
                 continue;
             }
         };
@@ -185,8 +217,12 @@ pub fn discover(root: &Path) -> anyhow::Result<Vec<SessionFile>> {
             });
         }
     }
-    tracing::debug!(count = out.len(), "session discovery complete");
-    Ok(out)
+    tracing::debug!(
+        count = out.len(),
+        skipped_dirs = stats.skipped_dirs,
+        "session discovery complete"
+    );
+    Ok((out, stats))
 }
 
 fn collect_subagents(
@@ -259,7 +295,7 @@ pub fn active_session(cwd: &Path, within: Duration) -> anyhow::Result<Option<Ses
     let Some(root) = projects_root() else {
         return Ok(None);
     };
-    let all = discover(&root)?;
+    let (all, _stats) = discover(&root)?;
     let candidates = filter_by_cwd(&all, cwd);
     let Some(newest) = most_recent(&candidates) else {
         return Ok(None);
@@ -302,12 +338,13 @@ mod tests {
         File::create(proj.join("ignore.txt")).unwrap();
         fs::create_dir_all(proj.join("nested")).unwrap();
 
-        let sessions = discover(root).unwrap();
+        let (sessions, stats) = discover(root).unwrap();
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].session_id, "abc");
         // No jsonl line carries `cwd`, so we fall back to the lossy decode.
         assert_eq!(sessions[0].project_cwd, PathBuf::from("/tmp/project/a"));
         assert!(sessions[0].size > 0);
+        assert!(stats.is_clean());
     }
 
     #[test]
@@ -331,7 +368,7 @@ mod tests {
         )
         .unwrap();
 
-        let sessions = discover(root).unwrap();
+        let (sessions, _stats) = discover(root).unwrap();
         assert_eq!(sessions.len(), 1);
         assert_eq!(
             sessions[0].project_cwd,
@@ -359,8 +396,9 @@ mod tests {
 
     #[test]
     fn discover_missing_root_returns_empty() {
-        let sessions = discover(Path::new("/definitely/does/not/exist/xyz123")).unwrap();
+        let (sessions, stats) = discover(Path::new("/definitely/does/not/exist/xyz123")).unwrap();
         assert!(sessions.is_empty());
+        assert!(stats.is_clean());
     }
 
     #[test]
@@ -372,7 +410,7 @@ mod tests {
         File::create(proj.join("old.jsonl")).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(10));
         File::create(proj.join("new.jsonl")).unwrap();
-        let sessions = discover(root).unwrap();
+        let (sessions, _stats) = discover(root).unwrap();
         let newest = most_recent(&sessions).unwrap();
         assert_eq!(newest.session_id, "new");
     }
@@ -389,7 +427,7 @@ mod tests {
         File::create(agents.join("agent-1.jsonl")).unwrap();
         File::create(agents.join("agent-2.jsonl")).unwrap();
 
-        let sessions = discover(root).unwrap();
+        let (sessions, _stats) = discover(root).unwrap();
         let primary: Vec<_> = sessions
             .iter()
             .filter(|s| s.kind == SessionKind::Primary)
@@ -403,6 +441,43 @@ mod tests {
         assert!(sub
             .iter()
             .all(|s| s.parent_session_id.as_deref() == Some("aaaa-bbbb")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discover_counts_unreadable_project_dir_as_skipped() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        // A readable project dir with one session — baseline.
+        let readable = root.join("-readable");
+        fs::create_dir_all(&readable).unwrap();
+        File::create(readable.join("s1.jsonl")).unwrap();
+
+        // An unreadable project dir — `read_dir` should fail with
+        // EACCES, and `discover` should count it as skipped rather
+        // than crashing or silently losing it.
+        let locked = root.join("-locked");
+        fs::create_dir_all(&locked).unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let result = discover(root);
+
+        // Restore permissions so tempfile can clean up, no matter
+        // what the assertion below does.
+        let _ = fs::set_permissions(&locked, fs::Permissions::from_mode(0o755));
+
+        let (sessions, stats) = result.unwrap();
+        assert_eq!(sessions.len(), 1, "readable session should still surface");
+        assert_eq!(stats.skipped_dirs, 1, "locked dir must be counted");
+        assert!(!stats.is_clean());
+    }
+
+    #[test]
+    fn discovery_stats_default_is_clean() {
+        assert!(DiscoveryStats::default().is_clean());
+        assert!(!DiscoveryStats { skipped_dirs: 1 }.is_clean());
     }
 
     #[test]

@@ -7,11 +7,12 @@ use ccs_core::{jsonl, session, tail};
 
 fn main() -> anyhow::Result<()> {
     let root = session::projects_root().expect("no home dir");
-    let sessions = session::discover(&root)?;
+    let (sessions, stats) = session::discover(&root)?;
     println!(
-        "discovered {} sessions under {}",
+        "discovered {} sessions under {} ({} dirs skipped)",
         sessions.len(),
-        root.display()
+        root.display(),
+        stats.skipped_dirs,
     );
 
     let mut total_lines = 0usize;
