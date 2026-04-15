@@ -150,6 +150,7 @@ dependencies = [
  "ccs-tui",
  "clap",
  "dirs",
+ "tempfile",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
