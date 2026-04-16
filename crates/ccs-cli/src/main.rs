@@ -95,20 +95,23 @@ fn main() -> Result<()> {
 /// top. This replaces a hard filter-by-cwd, which was too aggressive and
 /// hid relevant sessions from nearby directories.
 fn build_picker() -> Result<PickerState> {
-    let sessions = discover_sessions()?;
+    let (sessions, stats, root) = discover_sessions()?;
     let cwd = std::env::current_dir().ok();
-    Ok(PickerState::new(
-        sessions,
-        Box::new(LazyFsSource),
-        cwd.as_deref(),
-    ))
+    let mut picker = PickerState::new(sessions, Box::new(LazyFsSource), cwd.as_deref());
+    picker.set_discovery_info(stats.skipped_dirs, root);
+    Ok(picker)
 }
 
-fn discover_sessions() -> Result<Vec<SessionFile>> {
+/// Returns the discovered sessions, discovery stats, and the actual
+/// projects root used — the picker surfaces the root in its empty
+/// state so the user sees *which* directory came back empty, and the
+/// stats so we can tell them "3 dirs skipped" when permissions bite.
+fn discover_sessions() -> Result<(Vec<SessionFile>, session::DiscoveryStats, Option<PathBuf>)> {
     let Some(root) = session::projects_root() else {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), session::DiscoveryStats::default(), None));
     };
-    session::discover(&root)
+    let (sessions, stats) = session::discover(&root)?;
+    Ok((sessions, stats, Some(root)))
 }
 
 /// Resolve the `session` positional arg into an optional [`SessionFile`].
@@ -133,7 +136,8 @@ fn resolve_session_target(target: &str) -> Result<Option<SessionFile>> {
             "session file not found: {target} (path does not exist or is not a regular file)"
         );
     }
-    Ok(discover_sessions()?
+    let (sessions, _stats, _root) = discover_sessions()?;
+    Ok(sessions
         .into_iter()
         .find(|s| s.session_id.starts_with(target)))
 }

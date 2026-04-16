@@ -70,6 +70,15 @@ pub struct PickerState {
     /// transitions to the viewer screen on the next tick.
     open_requested: bool,
 
+    /// Count of project directories `discover()` refused to read (usually
+    /// permission errors). Surfaced in the footer so a user whose picker
+    /// looks short can see *why* without setting `RUST_LOG`.
+    skipped_dirs: usize,
+    /// The actual projects root `discover()` walked. Used by the
+    /// empty-state message and the footer so both reflect reality
+    /// instead of hard-coding `~/.claude/projects`.
+    projects_root: Option<PathBuf>,
+
     source: Box<dyn SessionMetadataSource + Send>,
     matcher: Matcher,
     char_buf: Vec<char>,
@@ -116,6 +125,8 @@ impl PickerState {
             search_query: String::new(),
             search_mode: false,
             open_requested: false,
+            skipped_dirs: 0,
+            projects_root: None,
             source,
             matcher: Matcher::new(Config::DEFAULT),
             char_buf: Vec::new(),
@@ -145,6 +156,23 @@ impl PickerState {
     /// round trips can assert the picker resumed where it left off.
     pub fn cursor(&self) -> usize {
         self.cursor
+    }
+
+    /// Record what the discovery pass found alongside the returned
+    /// sessions: how many project dirs were refused, and the real
+    /// projects root that was walked. Optional so tests that only
+    /// exercise rendering or navigation don't need to care.
+    pub fn set_discovery_info(&mut self, skipped_dirs: usize, projects_root: Option<PathBuf>) {
+        self.skipped_dirs = skipped_dirs;
+        self.projects_root = projects_root;
+    }
+
+    pub fn skipped_dirs(&self) -> usize {
+        self.skipped_dirs
+    }
+
+    pub fn projects_root(&self) -> Option<&Path> {
+        self.projects_root.as_deref()
     }
 
     /// Consume a pending open request, returning the selected session if
@@ -376,7 +404,8 @@ pub fn render(frame: &mut Frame, state: &PickerState) {
 
     if state.rows.is_empty() {
         frame.render_widget(
-            Paragraph::new("no sessions found under ~/.claude/projects").style(Style::new().dim()),
+            Paragraph::new(empty_state_message(state.projects_root.as_deref()))
+                .style(Style::new().dim()),
             body,
         );
     } else {
@@ -437,9 +466,36 @@ pub fn render(frame: &mut Frame, state: &PickerState) {
     let footer_text = if state.search_mode {
         format!("/{}  (Esc cancel · ↵ confirm)", state.search_query)
     } else {
-        "j/k move  ·  / search  ·  ↵ open  ·  q quit".to_string()
+        footer_text(state.skipped_dirs)
     };
     frame.render_widget(Paragraph::new(footer_text).dim(), footer);
+}
+
+/// Normal-mode footer text. Appends a `⚠ N dir(s) skipped` suffix
+/// when discovery refused to read one or more project directories —
+/// extracted as a pure function so the suffix logic is unit-testable
+/// without spinning up a ratatui `Frame`.
+fn footer_text(skipped_dirs: usize) -> String {
+    let base = "j/k move  ·  / search  ·  ↵ open  ·  q quit";
+    if skipped_dirs == 0 {
+        return base.to_string();
+    }
+    // Pluralize so `1 dir skipped` reads naturally. The suffix is
+    // terse on purpose — the footer is one line and splits its
+    // budget with the hotkey legend.
+    let plural = if skipped_dirs == 1 { "" } else { "s" };
+    format!("{base}  ·  ⚠ {skipped_dirs} dir{plural} skipped")
+}
+
+/// Empty-state body message. Formats the path discovery actually
+/// walked — not the hard-coded `~/.claude/projects` literal — so a
+/// future `--projects-root` flag or an overridden `$HOME` shows the
+/// real location that came back empty.
+fn empty_state_message(projects_root: Option<&Path>) -> String {
+    let root_display = projects_root
+        .map(display_path)
+        .unwrap_or_else(|| "~/.claude/projects".to_string());
+    format!("no sessions found under {root_display}")
 }
 
 fn format_relative_mtime(t: SystemTime) -> String {
@@ -784,5 +840,53 @@ mod tests {
             3,
             "each row should be fetched exactly once, regardless of revisits"
         );
+    }
+
+    #[test]
+    fn footer_text_hides_skipped_suffix_when_count_is_zero() {
+        let s = footer_text(0);
+        assert!(!s.contains("skipped"), "clean runs must not flash a warn");
+    }
+
+    #[test]
+    fn footer_text_pluralizes_singular_vs_plural() {
+        assert!(footer_text(1).contains("1 dir skipped"));
+        assert!(footer_text(3).contains("3 dirs skipped"));
+    }
+
+    #[test]
+    fn footer_text_keeps_hotkey_legend() {
+        // The suffix must be additive — the hotkey legend is still
+        // needed when the user sees a skip warning.
+        let s = footer_text(2);
+        assert!(s.contains("q quit"));
+        assert!(s.contains("skipped"));
+    }
+
+    #[test]
+    fn empty_state_falls_back_to_default_path_when_unknown() {
+        let msg = empty_state_message(None);
+        assert_eq!(msg, "no sessions found under ~/.claude/projects");
+    }
+
+    #[test]
+    fn empty_state_uses_the_real_projects_root_path() {
+        let p = PathBuf::from("/var/tmp/fake-projects");
+        let msg = empty_state_message(Some(&p));
+        assert!(
+            msg.contains("/var/tmp/fake-projects"),
+            "empty-state message must reflect the real discovery root: {msg}",
+        );
+    }
+
+    #[test]
+    fn set_discovery_info_round_trips_to_accessors() {
+        let mut s = state(vec![]);
+        assert_eq!(s.skipped_dirs(), 0);
+        assert!(s.projects_root().is_none());
+
+        s.set_discovery_info(4, Some(PathBuf::from("/tmp/roots")));
+        assert_eq!(s.skipped_dirs(), 4);
+        assert_eq!(s.projects_root(), Some(Path::new("/tmp/roots")));
     }
 }
