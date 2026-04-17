@@ -1,14 +1,16 @@
 mod logging;
 
+use std::io::IsTerminal;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc;
+use std::time::SystemTime;
+
 use anyhow::Result;
 use ccs_core::metadata::LazyFsSource;
 use ccs_core::session::{self, SessionFile, SessionKind};
 use ccs_tui::ui::picker::PickerState;
 use ccs_tui::{App, Screen};
 use clap::Parser;
-use std::io::IsTerminal;
-use std::path::{Path, PathBuf};
-use std::time::SystemTime;
 
 use crate::logging::LogFormat;
 
@@ -68,14 +70,27 @@ fn main() -> Result<()> {
             };
             Screen::viewer(false, session)
         }
-        (false, None) => Screen::Picker(build_picker()?),
+        (false, None) => {
+            // Enter the TUI immediately with an empty picker in
+            // "loading" state, then discover sessions on a background
+            // thread and stream them in batch-by-batch.
+            if !std::io::stdout().is_terminal() {
+                anyhow::bail!(
+                    "claude-code-scrollback requires an interactive terminal (stdout is not a TTY)"
+                );
+            }
+            let cwd = std::env::current_dir().ok();
+            let (picker, rx) = build_picker_streaming(cwd.as_deref())?;
+            let mut terminal = ccs_tui::init();
+            let result =
+                App::new_with_discovery(Screen::Picker(picker), rx, cwd).run(&mut terminal);
+            ccs_tui::restore();
+            return result;
+        }
     };
 
-    // TUI requires a real terminal. Bail cleanly if we were piped or
-    // redirected — otherwise ratatui's init panics inside the
-    // alternate-screen-buffer sequence, which leaves the user's
-    // terminal in a bad state. First-run experience is one of
-    // PJH-53's success criteria; this keeps it clean.
+    // Non-picker entry points (--live, explicit session) don't need
+    // streaming discovery, so they keep the old synchronous path.
     if !std::io::stdout().is_terminal() {
         anyhow::bail!(
             "claude-code-scrollback requires an interactive terminal (stdout is not a TTY)"
@@ -88,18 +103,28 @@ fn main() -> Result<()> {
     result
 }
 
-/// Walk `~/.claude/projects/` and build the picker state. All discovered
-/// sessions are kept so the user can always reach them, but they are ranked
-/// by [`ccs_tui::ui::picker::cwd_affinity`] against the current working
-/// directory so sessions for the project you launched from bubble to the
-/// top. This replaces a hard filter-by-cwd, which was too aggressive and
-/// hid relevant sessions from nearby directories.
-fn build_picker() -> Result<PickerState> {
-    let (sessions, stats, root) = discover_sessions()?;
-    let cwd = std::env::current_dir().ok();
-    let mut picker = PickerState::new(sessions, Box::new(LazyFsSource), cwd.as_deref());
-    picker.set_discovery_info(stats.skipped_dirs, root);
-    Ok(picker)
+/// Launch discovery on a background thread and return an empty
+/// `PickerState` in loading state plus the receiving end of the
+/// channel. The event loop drains the channel each tick.
+fn build_picker_streaming(
+    launch_cwd: Option<&Path>,
+) -> Result<(PickerState, mpsc::Receiver<session::DiscoveryMsg>)> {
+    let mut picker = PickerState::new_loading(Box::new(LazyFsSource), launch_cwd);
+    if let Some(root) = session::projects_root() {
+        picker.set_discovery_info(0, Some(root.clone()));
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            if let Err(e) = session::discover_streaming(&root, tx) {
+                tracing::error!(error = %e, "background discovery failed");
+            }
+        });
+        Ok((picker, rx))
+    } else {
+        // No home dir — finish loading immediately (empty picker).
+        picker.finish_loading();
+        let (_tx, rx) = mpsc::channel();
+        Ok((picker, rx))
+    }
 }
 
 /// Returns the discovered sessions, discovery stats, and the actual

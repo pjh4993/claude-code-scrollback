@@ -1,8 +1,10 @@
+use std::path::PathBuf;
+use std::sync::mpsc;
 use std::time::Duration;
 
 use anyhow::Result;
 use ccs_core::checkpoints;
-use ccs_core::session::SessionFile;
+use ccs_core::session::{DiscoveryMsg, SessionFile};
 use ccs_core::transcript;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::DefaultTerminal;
@@ -133,6 +135,14 @@ impl Screen {
 pub struct App {
     screen: Screen,
     should_quit: bool,
+    /// Receives batches of [`SessionFile`]s from a background discovery
+    /// thread. `None` when discovery isn't streaming (viewer-only entry,
+    /// or after `Done` has been received).
+    discovery_rx: Option<mpsc::Receiver<DiscoveryMsg>>,
+    /// The launch CWD passed to `append_sessions` for affinity sorting
+    /// as batches arrive. Stashed here because the background thread
+    /// doesn't know the picker's sort key.
+    launch_cwd: Option<PathBuf>,
 }
 
 impl App {
@@ -141,13 +151,31 @@ impl App {
         Self {
             screen,
             should_quit: false,
+            discovery_rx: None,
+            launch_cwd: None,
         }
+    }
+
+    /// Construct with a streaming discovery channel. The event loop
+    /// drains batches each tick and feeds them into the picker.
+    pub fn new_with_discovery(
+        screen: Screen,
+        rx: mpsc::Receiver<DiscoveryMsg>,
+        launch_cwd: Option<PathBuf>,
+    ) -> Self {
+        let mut app = Self::new(screen);
+        app.discovery_rx = Some(rx);
+        app.launch_cwd = launch_cwd;
+        app
     }
 
     #[tracing::instrument(level = "debug", skip_all)]
     pub fn run(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
         tracing::info!("entering tui run loop");
         while !self.should_quit {
+            // Drain any pending discovery batches so new sessions
+            // appear in this frame.
+            self.poll_discovery();
             // Poll the live-tail file first so any new events appear
             // in this frame rather than the next one.
             self.poll_live_tail();
@@ -164,6 +192,40 @@ impl App {
             self.process_screen_transitions();
         }
         Ok(())
+    }
+
+    /// Drain all pending discovery batches from the background thread.
+    /// Non-blocking: `try_recv` pulls whatever is ready, then returns.
+    fn poll_discovery(&mut self) {
+        let Some(rx) = self.discovery_rx.as_ref() else {
+            return;
+        };
+        let Screen::Picker(picker) = &mut self.screen else {
+            return;
+        };
+        let cwd = self.launch_cwd.as_deref();
+        loop {
+            match rx.try_recv() {
+                Ok(DiscoveryMsg::Batch(sessions)) => {
+                    picker.append_sessions(sessions, cwd);
+                }
+                Ok(DiscoveryMsg::Done(stats)) => {
+                    picker.set_discovery_info(stats.skipped_dirs, None);
+                    picker.finish_loading();
+                    // Channel exhausted — drop the receiver so we
+                    // stop polling on future ticks.
+                    self.discovery_rx = None;
+                    return;
+                }
+                Err(mpsc::TryRecvError::Empty) => return,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    // Thread panicked or exited without sending Done.
+                    picker.finish_loading();
+                    self.discovery_rx = None;
+                    return;
+                }
+            }
+        }
     }
 
     fn poll_live_tail(&mut self) {
