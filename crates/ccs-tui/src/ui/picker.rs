@@ -70,6 +70,11 @@ pub struct PickerState {
     /// transitions to the viewer screen on the next tick.
     open_requested: bool,
 
+    /// True while the background discovery thread is still sending
+    /// batches. The footer shows a "scanning…" indicator until `Done`
+    /// arrives and this is flipped to `false`.
+    loading: bool,
+
     /// Count of project directories `discover()` refused to read (usually
     /// permission errors). Surfaced in the footer so a user whose picker
     /// looks short can see *why* without setting `RUST_LOG`.
@@ -125,6 +130,7 @@ impl PickerState {
             search_query: String::new(),
             search_mode: false,
             open_requested: false,
+            loading: false,
             skipped_dirs: 0,
             projects_root: None,
             source,
@@ -133,6 +139,85 @@ impl PickerState {
         };
         state.ensure_preview_for_cursor();
         state
+    }
+
+    /// Build an empty picker in "loading" state. The caller feeds
+    /// sessions incrementally via [`append_sessions`](Self::append_sessions)
+    /// as a background discovery thread streams them in.
+    pub fn new_loading(
+        source: Box<dyn SessionMetadataSource + Send>,
+        launch_cwd: Option<&Path>,
+    ) -> Self {
+        let mut state = Self::new(Vec::new(), source, launch_cwd);
+        state.loading = true;
+        state
+    }
+
+    /// True while the background discovery thread is still running.
+    pub fn is_loading(&self) -> bool {
+        self.loading
+    }
+
+    /// Signal that discovery is complete. Flips the loading indicator
+    /// off so the footer switches from "scanning…" to the normal
+    /// hotkey legend.
+    pub fn finish_loading(&mut self) {
+        self.loading = false;
+    }
+
+    /// Merge a batch of newly-discovered sessions into the picker.
+    /// Re-sorts and re-filters so the cursor stays as close to its
+    /// previous position as possible.
+    pub fn append_sessions(&mut self, mut sessions: Vec<SessionFile>, launch_cwd: Option<&Path>) {
+        if sessions.is_empty() {
+            return;
+        }
+        // Remember the session the cursor is currently on so we can
+        // restore it after the re-sort.
+        let prev_session_id = self
+            .filtered
+            .get(self.cursor)
+            .and_then(|&idx| self.rows.get(idx))
+            .map(|r| r.session.session_id.clone());
+
+        // Append new rows.
+        let _start_idx = self.rows.len();
+        sessions
+            .drain(..)
+            .for_each(|s| self.rows.push(PickerRow::new(s)));
+
+        // Re-sort the entire row list (discovery order is per-project,
+        // not global) using the same comparator as `new()`.
+        let launch_cwd: Option<PathBuf> = launch_cwd.map(|p| p.to_path_buf());
+        self.rows.sort_by(|a, b| {
+            let a_affinity = launch_cwd
+                .as_deref()
+                .map(|cwd| cwd_affinity(&a.session.project_cwd, cwd))
+                .unwrap_or(0);
+            let b_affinity = launch_cwd
+                .as_deref()
+                .map(|cwd| cwd_affinity(&b.session.project_cwd, cwd))
+                .unwrap_or(0);
+            b_affinity
+                .cmp(&a_affinity)
+                .then_with(|| b.session.modified.cmp(&a.session.modified))
+        });
+
+        // Re-filter against the current search query.
+        self.recompute_filter();
+
+        // Try to restore the cursor to the previously-selected session
+        // so appending doesn't yank the user's focus.
+        if let Some(prev_id) = prev_session_id {
+            if let Some(pos) = self
+                .filtered
+                .iter()
+                .position(|&idx| self.rows[idx].session.session_id == prev_id)
+            {
+                self.cursor = pos;
+            }
+        }
+        self.ensure_preview_for_cursor();
     }
 
     pub fn is_empty(&self) -> bool {
@@ -169,6 +254,14 @@ impl PickerState {
 
     pub fn skipped_dirs(&self) -> usize {
         self.skipped_dirs
+    }
+
+    /// Update only the skip count without touching `projects_root`.
+    /// Used by `poll_discovery` when `Done` arrives — `projects_root`
+    /// was already set during `build_picker_streaming` and must not
+    /// be overwritten with `None`.
+    pub fn set_skipped_dirs(&mut self, count: usize) {
+        self.skipped_dirs = count;
     }
 
     pub fn projects_root(&self) -> Option<&Path> {
@@ -287,7 +380,7 @@ impl PickerState {
                 scored.push((score, idx));
             }
         }
-        scored.sort_by(|a, b| b.0.cmp(&a.0));
+        scored.sort_by_key(|s| std::cmp::Reverse(s.0));
         self.filtered = scored.into_iter().map(|(_, idx)| idx).collect();
         self.cursor = 0;
         self.ensure_preview_for_cursor();
@@ -390,22 +483,18 @@ pub fn render(frame: &mut Frame, state: &PickerState) {
     ])
     .areas(frame.area());
 
-    let title = if state.search_query.is_empty() {
-        format!("claude-code-scrollback — {} sessions", state.rows.len())
-    } else {
-        format!(
-            "claude-code-scrollback — {}/{} sessions · filter “{}”",
-            state.filtered.len(),
-            state.rows.len(),
-            state.search_query
-        )
-    };
+    let title = build_title(state);
     frame.render_widget(Paragraph::new(title).style(Style::new().bold()), header);
 
-    if state.rows.is_empty() {
+    if state.rows.is_empty() && !state.loading {
         frame.render_widget(
             Paragraph::new(empty_state_message(state.projects_root.as_deref()))
                 .style(Style::new().dim()),
+            body,
+        );
+    } else if state.rows.is_empty() && state.loading {
+        frame.render_widget(
+            Paragraph::new("scanning sessions\u{2026}").style(Style::new().dim()),
             body,
         );
     } else {
@@ -465,10 +554,33 @@ pub fn render(frame: &mut Frame, state: &PickerState) {
 
     let footer_text = if state.search_mode {
         format!("/{}  (Esc cancel · ↵ confirm)", state.search_query)
+    } else if state.loading {
+        format!("scanning…  {} sessions found so far", state.rows.len())
     } else {
         footer_text(state.skipped_dirs)
     };
     frame.render_widget(Paragraph::new(footer_text).dim(), footer);
+}
+
+fn build_title(state: &PickerState) -> String {
+    let loading_suffix = if state.loading {
+        " (scanning\u{2026})"
+    } else {
+        ""
+    };
+    if state.search_query.is_empty() {
+        format!(
+            "claude-code-scrollback \u{2014} {} sessions{loading_suffix}",
+            state.rows.len()
+        )
+    } else {
+        format!(
+            "claude-code-scrollback \u{2014} {}/{} sessions \u{00b7} filter \u{201c}{}\u{201d}{loading_suffix}",
+            state.filtered.len(),
+            state.rows.len(),
+            state.search_query
+        )
+    }
 }
 
 /// Normal-mode footer text. Appends a `⚠ N dir(s) skipped` suffix
@@ -480,9 +592,6 @@ fn footer_text(skipped_dirs: usize) -> String {
     if skipped_dirs == 0 {
         return base.to_string();
     }
-    // Pluralize so `1 dir skipped` reads naturally. The suffix is
-    // terse on purpose — the footer is one line and splits its
-    // budget with the hotkey legend.
     let plural = if skipped_dirs == 1 { "" } else { "s" };
     format!("{base}  ·  ⚠ {skipped_dirs} dir{plural} skipped")
 }
@@ -888,5 +997,104 @@ mod tests {
         s.set_discovery_info(4, Some(PathBuf::from("/tmp/roots")));
         assert_eq!(s.skipped_dirs(), 4);
         assert_eq!(s.projects_root(), Some(Path::new("/tmp/roots")));
+    }
+
+    #[test]
+    fn new_loading_starts_in_loading_state() {
+        let s = PickerState::new_loading(Box::new(NullSource), None);
+        assert!(s.is_loading());
+        assert!(s.is_empty());
+    }
+
+    #[test]
+    fn finish_loading_clears_loading_flag() {
+        let mut s = PickerState::new_loading(Box::new(NullSource), None);
+        s.finish_loading();
+        assert!(!s.is_loading());
+    }
+
+    #[test]
+    fn append_sessions_grows_the_row_list_incrementally() {
+        let mut s = PickerState::new_loading(Box::new(NullSource), None);
+        assert_eq!(s.total_len(), 0);
+
+        s.append_sessions(vec![session("a", "/a", 100, 0)], None);
+        assert_eq!(s.total_len(), 1);
+
+        s.append_sessions(
+            vec![session("b", "/b", 200, 0), session("c", "/c", 300, 0)],
+            None,
+        );
+        assert_eq!(s.total_len(), 3);
+    }
+
+    #[test]
+    fn append_sessions_preserves_cursor_position() {
+        // Start with two sessions, move cursor to the second one.
+        let mut s = state(vec![
+            session("old", "/a", 100, 0),
+            session("new", "/b", 200, 0),
+        ]);
+        s.move_down();
+        // Cursor is on "old" (position 1 after mtime-desc sort: "new" at 0, "old" at 1).
+        let prev_id = s
+            .filtered
+            .get(s.cursor())
+            .map(|&idx| s.rows[idx].session.session_id.clone())
+            .unwrap();
+
+        // Append a session — the previously selected session must
+        // stay selected even though the sorted indices shift.
+        s.append_sessions(vec![session("newest", "/c", 400, 0)], None);
+
+        let current_id = s
+            .filtered
+            .get(s.cursor())
+            .map(|&idx| s.rows[idx].session.session_id.clone())
+            .unwrap();
+        assert_eq!(
+            current_id, prev_id,
+            "cursor should still point at the same session after append"
+        );
+    }
+
+    #[test]
+    fn append_sessions_respects_active_search_filter() {
+        let mut s = PickerState::new_loading(Box::new(NullSource), None);
+        s.enter_search();
+        s.push_search_char('a');
+        s.exit_search();
+
+        // Append two sessions, one matching the filter, one not.
+        s.append_sessions(
+            vec![
+                session("alpha", "/a", 100, 0),
+                session("beta", "/b", 200, 0),
+            ],
+            None,
+        );
+
+        assert_eq!(s.total_len(), 2);
+        // "alpha" matches the "a" filter, "beta" does too (contains "a").
+        // Both match, but let's verify the filtered list is consistent.
+        assert!(
+            s.visible_len() <= s.total_len(),
+            "visible can't exceed total"
+        );
+        assert!(s.visible_len() > 0, "at least one session should match 'a'");
+    }
+
+    #[test]
+    fn build_title_shows_scanning_suffix_while_loading() {
+        let mut s = PickerState::new_loading(Box::new(NullSource), None);
+        let title = build_title(&s);
+        assert!(title.contains("scanning"), "loading title: {title}");
+
+        s.finish_loading();
+        let title = build_title(&s);
+        assert!(
+            !title.contains("scanning"),
+            "finished title should not say scanning: {title}"
+        );
     }
 }

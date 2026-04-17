@@ -23,6 +23,7 @@
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 use std::time::{Duration, SystemTime};
 
 /// Maximum lines scanned per JSONL when looking for a `cwd` field. The
@@ -162,59 +163,12 @@ pub fn discover(root: &Path) -> anyhow::Result<(Vec<SessionFile>, DiscoveryStats
     };
 
     for project in project_dirs.flatten() {
-        let project_path = project.path();
-        if !project_path.is_dir() {
-            continue;
-        }
-        let name = match project.file_name().into_string() {
-            Ok(n) => n,
-            Err(_) => continue,
-        };
-        let project_cwd =
-            read_cwd_from_project_dir(&project_path).unwrap_or_else(|| decode_project_dir(&name));
-
-        let sessions = match fs::read_dir(&project_path) {
-            Ok(rd) => rd,
-            Err(e) => {
-                // Bumped from `trace!` — permission-denied under
-                // `~/.claude/projects` is the single most common
-                // reason sessions silently disappear from the
-                // picker, and the user needs a way to see it
-                // without rerunning with `RUST_LOG=trace`.
-                tracing::warn!(path=?project_path, error=%e, "skipping unreadable project dir");
+        match collect_project_dir(&project) {
+            ProjectDirResult::Sessions(batch) => out.extend(batch),
+            ProjectDirResult::Skipped => {
                 stats.skipped_dirs += 1;
-                continue;
             }
-        };
-        for session in sessions.flatten() {
-            let path = session.path();
-            if path.is_dir() {
-                // Primary session folders may hold `subagents/*.jsonl`
-                // sidechains. Enumerate those as secondary SessionFiles
-                // tagged with the parent session id.
-                if let Some(parent_id) = path.file_name().and_then(|s| s.to_str()) {
-                    collect_subagents(&path.join("subagents"), parent_id, &project_cwd, &mut out);
-                }
-                continue;
-            }
-            if path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
-                continue;
-            }
-            let Ok(meta) = session.metadata() else {
-                continue;
-            };
-            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
-                continue;
-            };
-            out.push(SessionFile {
-                session_id: stem.to_string(),
-                parent_session_id: None,
-                kind: SessionKind::Primary,
-                path,
-                project_cwd: project_cwd.clone(),
-                modified: meta.modified().unwrap_or(SystemTime::UNIX_EPOCH),
-                size: meta.len(),
-            });
+            ProjectDirResult::Skip => {}
         }
     }
     tracing::debug!(
@@ -223,6 +177,125 @@ pub fn discover(root: &Path) -> anyhow::Result<(Vec<SessionFile>, DiscoveryStats
         "session discovery complete"
     );
     Ok((out, stats))
+}
+
+/// Message sent from a streaming discovery thread to the UI event loop.
+pub enum DiscoveryMsg {
+    /// Sessions from one project directory. May be empty if the dir
+    /// contained no `.jsonl` files.
+    Batch(Vec<SessionFile>),
+    /// Discovery is complete. Carries final stats. The receiver should
+    /// drop the channel after handling this.
+    Done(DiscoveryStats),
+}
+
+/// Streaming variant of [`discover`]. Walks `root` and sends one
+/// [`DiscoveryMsg::Batch`] per project directory as it goes, followed
+/// by a final [`DiscoveryMsg::Done`]. Designed for
+/// `std::thread::spawn` — the UI thread can `try_recv` batches on
+/// each event-loop tick to populate the picker incrementally.
+///
+/// If the receiver is dropped mid-discovery (e.g. the user quits
+/// before scanning finishes), sends will fail silently and the thread
+/// exits.
+#[tracing::instrument(level = "debug", skip_all, fields(root = %root.display()))]
+pub fn discover_streaming(root: &Path, tx: mpsc::Sender<DiscoveryMsg>) -> anyhow::Result<()> {
+    let mut stats = DiscoveryStats::default();
+    let mut total = 0usize;
+    let project_dirs = match fs::read_dir(root) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let _ = tx.send(DiscoveryMsg::Done(stats));
+            return Ok(());
+        }
+        Err(e) => return Err(e.into()),
+    };
+
+    for project in project_dirs.flatten() {
+        match collect_project_dir(&project) {
+            ProjectDirResult::Sessions(batch) => {
+                total += batch.len();
+                // Silently stop if the receiver hung up.
+                if tx.send(DiscoveryMsg::Batch(batch)).is_err() {
+                    return Ok(());
+                }
+            }
+            ProjectDirResult::Skipped => {
+                stats.skipped_dirs += 1;
+            }
+            ProjectDirResult::Skip => {}
+        }
+    }
+    tracing::debug!(
+        count = total,
+        skipped_dirs = stats.skipped_dirs,
+        "streaming session discovery complete"
+    );
+    let _ = tx.send(DiscoveryMsg::Done(stats));
+    Ok(())
+}
+
+/// Outcome of processing a single top-level project directory.
+enum ProjectDirResult {
+    /// Successfully collected sessions (may be empty if dir has no JSONL).
+    Sessions(Vec<SessionFile>),
+    /// Directory could not be read (permission-denied, etc.) — caller
+    /// increments `stats.skipped_dirs`.
+    Skipped,
+    /// Entry was not a directory or had an unparseable name — skip silently.
+    Skip,
+}
+
+/// Enumerate one project directory and collect its session files.
+fn collect_project_dir(project: &fs::DirEntry) -> ProjectDirResult {
+    let project_path = project.path();
+    if !project_path.is_dir() {
+        return ProjectDirResult::Skip;
+    }
+    let name = match project.file_name().into_string() {
+        Ok(n) => n,
+        Err(_) => return ProjectDirResult::Skip,
+    };
+    let project_cwd =
+        read_cwd_from_project_dir(&project_path).unwrap_or_else(|| decode_project_dir(&name));
+
+    let rd = match fs::read_dir(&project_path) {
+        Ok(rd) => rd,
+        Err(e) => {
+            tracing::warn!(path=?project_path, error=%e, "skipping unreadable project dir");
+            return ProjectDirResult::Skipped;
+        }
+    };
+
+    let mut out = Vec::new();
+    for session in rd.flatten() {
+        let path = session.path();
+        if path.is_dir() {
+            if let Some(parent_id) = path.file_name().and_then(|s| s.to_str()) {
+                collect_subagents(&path.join("subagents"), parent_id, &project_cwd, &mut out);
+            }
+            continue;
+        }
+        if path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let Ok(meta) = session.metadata() else {
+            continue;
+        };
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        out.push(SessionFile {
+            session_id: stem.to_string(),
+            parent_session_id: None,
+            kind: SessionKind::Primary,
+            path,
+            project_cwd: project_cwd.clone(),
+            modified: meta.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+            size: meta.len(),
+        });
+    }
+    ProjectDirResult::Sessions(out)
 }
 
 fn collect_subagents(
