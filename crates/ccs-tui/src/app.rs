@@ -210,7 +210,10 @@ impl App {
                     picker.append_sessions(sessions, cwd);
                 }
                 Ok(DiscoveryMsg::Done(stats)) => {
-                    picker.set_discovery_info(stats.skipped_dirs, None);
+                    // Only update the skip count — projects_root was
+                    // already set in build_picker_streaming and must
+                    // not be overwritten with None here.
+                    picker.set_skipped_dirs(stats.skipped_dirs);
                     picker.finish_loading();
                     // Channel exhausted — drop the receiver so we
                     // stop polling on future ticks.

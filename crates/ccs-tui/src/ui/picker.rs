@@ -256,6 +256,14 @@ impl PickerState {
         self.skipped_dirs
     }
 
+    /// Update only the skip count without touching `projects_root`.
+    /// Used by `poll_discovery` when `Done` arrives — `projects_root`
+    /// was already set during `build_picker_streaming` and must not
+    /// be overwritten with `None`.
+    pub fn set_skipped_dirs(&mut self, count: usize) {
+        self.skipped_dirs = count;
+    }
+
     pub fn projects_root(&self) -> Option<&Path> {
         self.projects_root.as_deref()
     }
@@ -372,7 +380,7 @@ impl PickerState {
                 scored.push((score, idx));
             }
         }
-        scored.sort_by(|a, b| b.0.cmp(&a.0));
+        scored.sort_by_key(|s| std::cmp::Reverse(s.0));
         self.filtered = scored.into_iter().map(|(_, idx)| idx).collect();
         self.cursor = 0;
         self.ensure_preview_for_cursor();
